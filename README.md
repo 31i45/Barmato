@@ -1,14 +1,3 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: 'a5bfb5a8-e9ae-4e5a-a2be-bcfe9bcf5666'
-  PropagateID: 'a5bfb5a8-e9ae-4e5a-a2be-bcfe9bcf5666'
-  ReservedCode1: '2bc3b050-d944-4c00-abe0-4bc8a8808b6e'
-  ReservedCode2: '2bc3b050-d944-4c00-abe0-4bc8a8808b6e'
----
-
 # Barmato
 
 > Bar + Tomato — 极简环境式番茄钟 for Windows
@@ -114,5 +103,3 @@ cargo test
 ## 许可
 
 MIT
-
-> AI生成
