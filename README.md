@@ -1,0 +1,118 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: 'a5bfb5a8-e9ae-4e5a-a2be-bcfe9bcf5666'
+  PropagateID: 'a5bfb5a8-e9ae-4e5a-a2be-bcfe9bcf5666'
+  ReservedCode1: '2bc3b050-d944-4c00-abe0-4bc8a8808b6e'
+  ReservedCode2: '2bc3b050-d944-4c00-abe0-4bc8a8808b6e'
+---
+
+# Barmato
+
+> Bar + Tomato — 极简环境式番茄钟 for Windows
+
+Barmato 在任务栏上方渲染一条 5px 色彩细条，用颜色和进度提供无干扰的番茄周期环境反馈。没有弹窗、没有数字、没有声音——仅靠余光感知当前处于专注还是休息。
+
+## 截图
+
+（待补充）
+
+## 特性
+
+- **纯环境感知**：5px 细条 + 低饱和配色 + 进度填充 + 发光边缘，余光即可感知
+- **全周期连续进度**：细条整条宽度 = 一个完整番茄周期（25+5+25+5+25+5+25+20 = 135 分钟）
+- **极简交互**：左键点击托盘图标启停切换，右键退出，仅此而已
+- **零干扰**：无弹窗、无通知、无音效、无统计、无设置窗口
+- **优雅降级**：资源管理器重启自动重建，配置缺失静默回退默认值
+- **极致轻量**：纯 Rust 原生，Release 构建约 460KB，待机时停止一切绘制
+
+## 快速开始
+
+### 构建
+
+```bash
+cargo build --release
+```
+
+可执行文件位于 `target/release/barmato.exe`。
+
+### 使用
+
+1. 双击 `barmato.exe` 启动，托盘区出现绿色圆点图标
+2. **左键点击**托盘图标 → 启动番茄周期
+3. 再次左键 → 暂停；再左键 → 继续
+4. **右键点击**托盘图标 → 退出
+
+### 配置（可选）
+
+Barmato 无需任何配置即可使用，默认时长为标准番茄钟（25/5/20 分钟）。
+
+高级用户可创建 `%APPDATA%\Barmato\config.json` 自定义时长和配色：
+
+```json
+{
+  "durations": {
+    "focus": 1500,
+    "short_break": 300,
+    "long_break": 1200
+  },
+  "colors": {
+    "focus": "#3A6B4C",
+    "short_break": "#59A8A6",
+    "long_break": "#6585B4"
+  },
+  "render_all_monitors": false
+}
+```
+
+时长单位为秒。配置文件缺失或格式错误时静默回退默认值。
+
+## 视觉设计
+
+| 阶段 | 颜色 | 含义 |
+|---|---|---|
+| Focus | 深绿 `#3A6B4C` | 深度专注中 |
+| Short Break | 薄荷青 `#59A8A6` | 短暂休息 |
+| Long Break | 浅蓝 `#6585B4` | 长休息，周期将结束 |
+| 暂停 | 原色相降亮 40% | 时间冻结 |
+
+细条渲染规则：
+- 底色铺满整条，进度用同色相提亮色从左至右叠加
+- 进度前沿有 8px 发光带（更亮色相），标记当前位置
+- 阶段切换时 0.6 秒平滑色彩过渡，无突变
+
+## 架构
+
+```
+main.rs      薄主线：消息循环 + 托盘事件 + 定时驱动
+cycle.rs     周期状态机：纯业务逻辑，零 Windows API 依赖
+overlay.rs   渲染层：分层透明窗口 + softbuffer 软件光栅化
+taskbar.rs   几何检测：定位任务栏句柄与矩形
+colors.rs    色彩模块：RGB/HSL 运算、配色、插值
+config.rs    配置加载：只读 JSON，静默回退
+```
+
+设计准则遵循《软件设计的哲学（第二版）》：深模块浅接口、最小化状态、围绕不变量设计、消除特殊场景。
+
+## 技术栈
+
+- **Rust** + **windows-rs 0.58** — 原生 Windows API
+- **softbuffer 0.4** — 软件光栅化，无 GPU 依赖
+- **tray-icon 0.19** — 系统托盘
+- **serde / serde_json** — 轻量配置解析
+
+## 测试
+
+```bash
+cargo test
+```
+
+26 个单元测试覆盖周期状态机、配色运算、几何检测、配置解析。
+
+## 许可
+
+MIT
+
+> AI生成

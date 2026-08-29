@@ -1,0 +1,14 @@
+# Rust 构建产物
+/target/
+
+# 临时文件
+/.temp/
+
+# IDE
+/.vscode/
+/.idea/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

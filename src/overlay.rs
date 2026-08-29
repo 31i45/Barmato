@@ -1,0 +1,431 @@
+//! 渲染绘制模块（文档 §6.4）
+//!
+//! 技术方案（文档 §4.1）：创建独立顶层分层窗口，紧贴任务栏屏幕内侧
+//! 呈现一条 3px 细条（环境感知条），用色彩+进度提供无干扰的环境反馈。
+//! 用 `HWND_TOPMOST` 保持置顶，用 `WS_EX_TRANSPARENT` 实现鼠标穿透，
+//! 用 `WS_EX_NOACTIVATE` 避免抢占焦点。
+//!
+//! **为何不用 `WS_CHILD` / `SetParent`**：
+//! 任务栏属于 explorer.exe 的线程。跨线程创建 `WS_CHILD` 子窗口在 Windows 上
+//! 会返回 NULL（`ERROR_ALREADY_EXISTS`）；`SetParent` 对 `WS_EX_LAYERED` 窗口
+//! 也无法正确建立父子关系。因此采用独立顶层窗口 + 精确 Z 序管理。
+//!
+//! **为何不覆盖任务栏本身**：
+//! 覆盖任务栏会遮挡系统图标，违反文档 §4.1「绝不被遮挡」。
+//! 细条紧贴任务栏外侧（屏幕内侧），既提供环境感知又不干扰任何系统功能。
+//!
+//! - 底色常亮：运行时细条铺阶段底色，余光即可感知（可感知性）；
+//!   进度用同色相提亮色从左至右匀速叠加。
+//!   待机时窗口整体隐藏，桌面恢复原生样式。
+//! - `WS_EX_LAYERED` + color-key 透明：分层窗口、`COLOR_KEY` 像素完全透明。
+//! - `WS_EX_TRANSPARENT`：鼠标输入穿透。
+//! - `softbuffer` 软件光栅化：纯色填充 + 进度条，无 GPU/浏览器依赖。
+//!
+//! 渲染范围仅限细条本身；点击判定在任务栏空白区域（文档 §3.1/§4.2），
+//! 二者职责分离，互不影响。
+//!
+//! 待机状态彻底隐藏并停止绘制（文档 §4.3：销毁渲染、极致轻量）。
+//! 阶段切换的色彩过渡插值也内埋于本模块（复杂度下沉，主线零感知）。
+
+use std::num::NonZeroU32;
+use std::sync::Once;
+use std::time::Instant;
+
+use raw_window_handle::{
+    DisplayHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::colors::{Rgb, COLOR_KEY};
+use crate::cycle::Snapshot;
+
+const CLASS_NAME: PCWSTR = w!("BarmatoOverlay");
+
+/// 阶段切换色彩过渡时长（文档 §4.3：平滑过渡、无突变）
+const TRANSITION_SECS: f64 = 0.6;
+
+/// 细条高度（屏幕像素）。5px 足够余光可感知，又不干扰任务栏内容。
+const BAR_HEIGHT_PX: i32 = 5;
+
+/// 进度边界发光宽度（像素）。在进度前沿处渲染一条更亮的色带，
+/// 类似发光边缘效果，增强当前进度位置的环境感知。
+const GLOW_WIDTH_PX: usize = 8;
+
+/// raw-window-handle 适配：把裸 HWND 包装成 softbuffer 需要的句柄类型
+struct WinHandle(HWND);
+
+impl HasWindowHandle for WinHandle {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, raw_window_handle::HandleError> {
+        let nz = std::num::NonZeroIsize::new(self.0 .0 as isize)
+            .ok_or(raw_window_handle::HandleError::Unavailable)?;
+        // SAFETY: HWND 由本进程创建且在当前线程有效
+        Ok(unsafe {
+            WindowHandle::borrow_raw(RawWindowHandle::Win32(Win32WindowHandle::new(nz)))
+        })
+    }
+}
+
+/// softbuffer 需要进程级显示句柄；Windows 下无真实句柄可借，
+/// 提供空壳即满足 raw-window-handle 契约（进程内唯一，无并发共享）。
+struct SoftbufferDisplay;
+
+impl HasDisplayHandle for SoftbufferDisplay {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(unsafe {
+            DisplayHandle::borrow_raw(RawDisplayHandle::Windows(WindowsDisplayHandle::new()))
+        })
+    }
+}
+
+/// 紧贴任务栏屏幕内侧的 5px 细条矩形。
+///
+/// 判定逻辑：
+/// - 水平任务栏（宽 > 高）：top == 0 → 顶部任务栏，细条在其下方；否则 → 底部任务栏，细条在其上方
+/// - 垂直任务栏（高 > 宽）：left == 0 → 左侧任务栏，细条在其右侧；否则 → 右侧任务栏，细条在其左侧
+///
+/// 主屏坐标系原点为 (0,0)，故 top==0 / left==0 可准确区分主屏顶部/左侧任务栏。
+/// 副屏场景下该启发式可能偏差，但副屏默认关闭渲染（文档 §4.1），影响可忽略。
+fn bar_rect(taskbar: RECT) -> Option<RECT> {
+    let w = taskbar.right - taskbar.left;
+    let h = taskbar.bottom - taskbar.top;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let strip = if h > w {
+        // 垂直任务栏（左侧/右侧）
+        if taskbar.left == 0 {
+            // 左侧任务栏 → 细条在其右侧（屏幕内侧）
+            RECT {
+                left: taskbar.right,
+                top: taskbar.top,
+                right: taskbar.right + BAR_HEIGHT_PX,
+                bottom: taskbar.bottom,
+            }
+        } else {
+            // 右侧任务栏 → 细条在其左侧（屏幕内侧）
+            RECT {
+                left: taskbar.left - BAR_HEIGHT_PX,
+                top: taskbar.top,
+                right: taskbar.left,
+                bottom: taskbar.bottom,
+            }
+        }
+    } else {
+        // 水平任务栏（顶部/底部）
+        if taskbar.top == 0 {
+            // 顶部任务栏 → 细条在其下方（屏幕内侧）
+            RECT {
+                left: taskbar.left,
+                top: taskbar.bottom,
+                right: taskbar.right,
+                bottom: taskbar.bottom + BAR_HEIGHT_PX,
+            }
+        } else {
+            // 底部任务栏 → 细条在其上方（屏幕内侧）
+            RECT {
+                left: taskbar.left,
+                top: taskbar.top - BAR_HEIGHT_PX,
+                right: taskbar.right,
+                bottom: taskbar.top,
+            }
+        }
+    };
+    // 安全兜底：细条不能有负坐标或零尺寸
+    if strip.left < 0 || strip.top < 0 || strip.right <= strip.left || strip.bottom <= strip.top {
+        return None;
+    }
+    Some(strip)
+}
+
+pub struct Overlay {
+    hwnd: HWND,
+    context: softbuffer::Context<SoftbufferDisplay>,
+    surface: Option<softbuffer::Surface<SoftbufferDisplay, WinHandle>>,
+    width: u32,
+    height: u32,
+    visible: bool,
+    // —— 阶段过渡插值状态（内埋于渲染模块，主线不感知）——
+    last_target: Option<Rgb>,
+    prev_color: Rgb,
+    transition_start: Option<Instant>,
+}
+
+impl Overlay {
+    /// 创建独立顶层分层窗口。失败返回 None，由上层静默降级。
+    pub fn new(taskbar: HWND) -> Option<Overlay> {
+        unsafe {
+            let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+            // 窗口类全进程只注册一次（重复注册会返回错误，用 Once 显式保证幂等）
+            static REGISTER: Once = Once::new();
+            REGISTER.call_once(|| {
+                let wc = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(wnd_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: CLASS_NAME,
+                    ..Default::default()
+                };
+                RegisterClassW(&wc);
+            });
+
+            // 独立顶层窗口（WS_POPUP），不作为任务栏子窗口——
+            // 跨线程 WS_CHILD 创建会失败，SetParent 对 LAYERED 也无效。
+            // 用独立窗口 + 精确位置/Z序实现覆盖。
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                CLASS_NAME,
+                None,
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .ok()?;
+
+            // color-key 透明：COLOR_KEY 像素完全透明，透出任务栏原生底色
+            SetLayeredWindowAttributes(
+                hwnd,
+                COLORREF(
+                    COLOR_KEY.r as u32
+                        | ((COLOR_KEY.g as u32) << 8)
+                        | ((COLOR_KEY.b as u32) << 16),
+                ),
+                0,
+                LWA_COLORKEY,
+            )
+            .ok()?;
+
+            // 关联任务栏句柄（供 show() 读取几何），但不建立父子关系
+            let _ = SetPropW(hwnd, w!("BarmatoTaskbar"), taskbar);
+
+            let context = softbuffer::Context::new(SoftbufferDisplay).ok()?;
+            Some(Overlay {
+                hwnd,
+                context,
+                surface: None,
+                width: 0,
+                height: 0,
+                visible: false,
+                last_target: None,
+                prev_color: Rgb::new(0, 0, 0),
+                transition_start: None,
+            })
+        }
+    }
+
+    /// 父任务栏是否仍然有效
+    pub fn is_alive(&self) -> bool {
+        unsafe { IsWindow(self.hwnd) }.as_bool()
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// 是否处于阶段过渡插值中（主线据此提高定时帧率，文档 §4.3）
+    pub fn is_transitioning(&self) -> bool {
+        self.transition_start.is_some()
+    }
+
+    /// 紧贴任务栏屏幕内侧显示 3px 细条。位置由 `bar_rect` 从任务栏矩形推导。
+    pub fn show(&mut self) {
+        unsafe {
+            // 读取关联的任务栏句柄
+            let taskbar = HWND(GetPropW(self.hwnd, w!("BarmatoTaskbar")).0 as *mut _);
+            if taskbar.is_invalid() {
+                return;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(taskbar, &mut r).is_err() {
+                return;
+            }
+            // 计算紧贴任务栏屏幕内侧的细条矩形
+            let Some(strip) = bar_rect(r) else {
+                return;
+            };
+            let w = (strip.right - strip.left).max(0);
+            let h = (strip.bottom - strip.top).max(0);
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                strip.left,
+                strip.top,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            self.width = w as u32;
+            self.height = h as u32;
+            self.visible = true;
+        }
+    }
+
+    /// 待机：隐藏窗口、释放表面，停止一切绘制（文档 §4.3）
+    pub fn hide(&mut self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        self.surface = None;
+        self.visible = false;
+        // 复位过渡状态：下个周期从纯净状态开始，不与上周期残色插值
+        self.last_target = None;
+        self.transition_start = None;
+    }
+
+    /// 按快照重绘一帧。任何渲染失败都静默降级为隐藏（文档 §6.4 / §7），
+    /// 上层发现 `is_visible()==false` 后会自动重新 `show()` 恢复。
+    pub fn render(&mut self, snap: Snapshot, target: Rgb, now: Instant) {
+        if !self.visible || snap.idle || self.width == 0 || self.height == 0 {
+            return;
+        }
+        let color = self.resolve_color(snap, target, now);
+        if self.draw(snap, color).is_err() {
+            self.hide();
+        }
+    }
+
+    /// 目标色 → 阶段过渡插值 → 暂停降亮，全部在此收敛（文档 §4.2 / §4.3）
+    fn resolve_color(&mut self, snap: Snapshot, target: Rgb, now: Instant) -> Rgb {
+        if self.last_target != Some(target) {
+            if let Some(prev) = self.last_target {
+                self.prev_color = prev;
+                self.transition_start = Some(now);
+            }
+            self.last_target = Some(target);
+        }
+        let base = match self.transition_start {
+            Some(t0) => {
+                let t = now.duration_since(t0).as_secs_f64() / TRANSITION_SECS;
+                if t >= 1.0 {
+                    self.transition_start = None;
+                    target
+                } else {
+                    self.prev_color.lerp(target, t)
+                }
+            }
+            None => target,
+        };
+        // 暂停：仅降低亮度 40%，不换色相（文档 §4.2）
+        if snap.paused {
+            base.darken(0.4)
+        } else {
+            base
+        }
+    }
+
+    fn draw(&mut self, snap: Snapshot, color: Rgb) -> Result<(), ()> {
+        let w = NonZeroU32::new(self.width).ok_or(())?;
+        let h = NonZeroU32::new(self.height).ok_or(())?;
+
+        if self.surface.is_none() {
+            self.surface = softbuffer::Surface::new(&self.context, WinHandle(self.hwnd)).ok();
+        }
+        let surface = self.surface.as_mut().ok_or(())?;
+        surface.resize(w, h).map_err(|_| ())?;
+
+        let mut buf = surface.buffer_mut().map_err(|_| ())?;
+        // 底色常亮：细条铺阶段底色，余光即可感知（可感知性）；
+        // 进度用同色相提亮色从左至右匀速叠加（文档 §4.2，仅变明度不换色相）。
+        // 暂停时底色已在 resolve_color 中整体降亮，进度相对关系保持不变。
+        let base = color.to_pixel();
+        let fill = color.lighten(0.35).to_pixel();
+        // 发光边缘色：比进度填充色更亮，在进度前沿处形成发光带
+        let glow = color.lighten(0.55).to_pixel();
+        let progress = snap.progress.clamp(0.0, 1.0);
+        let fill_w = ((self.width as f64) * progress) as usize;
+        let width = self.width as usize;
+        // 发光带范围：[fill_w - GLOW_WIDTH_PX, fill_w)，
+        // 不超出已填充区域，不延伸到未填充区域
+        let glow_start = fill_w.saturating_sub(GLOW_WIDTH_PX);
+        let glow_end = fill_w; // 不超出已填充区域
+        for row in buf.chunks_exact_mut(width) {
+            // 已填充区域的非发光部分
+            row[..glow_start].fill(fill);
+            // 发光带（进度前沿）
+            if glow_end > glow_start {
+                row[glow_start..glow_end].fill(glow);
+            }
+            // 未填充区域
+            row[fill_w..].fill(base);
+        }
+        buf.present().map_err(|_| ())?;
+        Ok(())
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // 覆盖层不处理任何消息（绘制由 softbuffer 直接提交），全部交给默认处理
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT { left: l, top: t, right: r, bottom: b }
+    }
+
+    #[test]
+    fn bar_rect_bottom_taskbar() {
+        // 底部任务栏（最常见）：细条在其上方
+        let tb = rect(0, 912, 1707, 960);
+        let strip = bar_rect(tb).unwrap();
+        assert_eq!(strip, rect(0, 907, 1707, 912));
+    }
+
+    #[test]
+    fn bar_rect_top_taskbar() {
+        // 顶部任务栏：细条在其下方
+        let tb = rect(0, 0, 1920, 48);
+        let strip = bar_rect(tb).unwrap();
+        assert_eq!(strip, rect(0, 48, 1920, 53));
+    }
+
+    #[test]
+    fn bar_rect_left_taskbar() {
+        // 左侧任务栏：细条在其右侧
+        let tb = rect(0, 0, 48, 1080);
+        let strip = bar_rect(tb).unwrap();
+        assert_eq!(strip, rect(48, 0, 53, 1080));
+    }
+
+    #[test]
+    fn bar_rect_right_taskbar() {
+        // 右侧任务栏：细条在其左侧
+        let tb = rect(1872, 0, 1920, 1080);
+        let strip = bar_rect(tb).unwrap();
+        assert_eq!(strip, rect(1867, 0, 1872, 1080));
+    }
+
+    #[test]
+    fn bar_rect_invalid_zero_size() {
+        assert_eq!(bar_rect(rect(0, 0, 0, 0)), None);
+    }
+
+    #[test]
+    fn bar_rect_invalid_inverted() {
+        assert_eq!(bar_rect(rect(100, 100, 50, 200)), None);
+    }
+}
