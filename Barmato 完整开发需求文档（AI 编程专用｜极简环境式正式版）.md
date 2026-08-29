@@ -1,14 +1,3 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: '9ec39393-27f4-43a9-970e-9b630967ebe9'
-  PropagateID: '9ec39393-27f4-43a9-970e-9b630967ebe9'
-  ReservedCode1: '9700201a-bcb3-4a05-8030-a6e0cf4feedc'
-  ReservedCode2: '9700201a-bcb3-4a05-8030-a6e0cf4feedc'
----
-
 # Barmato 完整开发需求文档（AI 编程专用｜极简环境式正式版）
 
 ## 0\. 文档说明
@@ -280,5 +269,3 @@ Windows 无原生任务栏背景修改 API，程序采用**分层透明无边框
 8. 完全符合深模块浅接口、极简环境式、专注优先的核心设计哲学
 
 > （注：部分内容可能由 AI 生成）
-
-> AI生成
