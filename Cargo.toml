@@ -1,6 +1,6 @@
 [package]
 name = "barmato"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Bar + Tomato — 极简环境式番茄钟：任务栏细条环境反馈，无弹窗、无数字、无声音"
 license = "MIT"

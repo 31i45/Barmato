@@ -25,7 +25,12 @@ Barmato 在任务栏上方渲染一条 5px 色彩细条，用颜色和进度提�
 
 ### 下载（推荐）
 
-前往 [Releases](https://github.com/31i45/Barmato/releases) 下载最新版 `barmato-vX.Y.Z-x86_64-windows.zip`，解压后直接运行 `barmato.exe`（单文件、零安装、零依赖）。
+前往 [Releases](https://github.com/31i45/Barmato/releases) 下载最新版，两种格式任选：
+
+- `barmato-vX.Y.Z-x86_64-windows.exe` — 单文件即下即用（浏览器可能提示"不常见下载"，选择保留即可）
+- `barmato-vX.Y.Z-x86_64-windows.zip` — 压缩包，下载拦截风险最低
+
+解压（如选 zip）后直接运行 `barmato.exe`：单文件、零安装、零依赖。
 
 ### 构建
 

@@ -33,12 +33,12 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dest = "barmato-${{ github.ref_name }}-x86_64-windows.zip"
-          Compress-Archive -Path target/release/barmato.exe -DestinationPath $dest
-          "ASSET=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $tag = "${{ github.ref_name }}"
+          Copy-Item target/release/barmato.exe "barmato-$tag-x86_64-windows.exe"
+          Compress-Archive -Path target/release/barmato.exe -DestinationPath "barmato-$tag-x86_64-windows.zip"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ASSET }}
+          files: barmato-${{ github.ref_name }}-x86_64-windows.*
           generate_release_notes: true
