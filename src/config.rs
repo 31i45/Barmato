@@ -157,9 +157,7 @@ mod tests {
     #[test]
     fn seconds_unit_accepted() {
         // 秒级配置：25s/5s/20s，用于快速验证大周期流转
-        let c = parse(
-            r##"{"durations":{"focus":25,"short_break":5,"long_break":20}}"##,
-        );
+        let c = parse(r##"{"durations":{"focus":25,"short_break":5,"long_break":20}}"##);
         assert_eq!(c.focus, Duration::from_secs(25));
         assert_eq!(c.short_break, Duration::from_secs(5));
         assert_eq!(c.long_break, Duration::from_secs(20));

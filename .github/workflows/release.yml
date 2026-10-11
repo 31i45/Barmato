@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Verify / Build / Publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test（发布前强制全绿）
+        run: cargo test
+
+      - name: Clippy（零警告门槛）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dest = "barmato-${{ github.ref_name }}-x86_64-windows.zip"
+          Compress-Archive -Path target/release/barmato.exe -DestinationPath $dest
+          "ASSET=$dest" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true

@@ -5,8 +5,8 @@
 //! 全部系统复杂度封装在各深模块内部。
 //!
 //! 职责分离不变量（文档 §3.1/§4.2）：
-//! **渲染覆盖整条任务栏宽度，细条整条代表一个完整番茄周期（8 阶段）；
-//! 交互入口为托盘图标左键，稳定可靠、不受任务栏布局影响**。
+//! **细条表达当前阶段进度，4 枚刻点以空间模式表达第 N 个专注番茄；
+//! 交互入口为托盘图标左键，托盘图标同步镜像当前状态（阶段色相/暂停空心/待机暗灰）**。
 
 #![windows_subsystem = "windows"]
 
@@ -25,7 +25,9 @@ use taskbar::Taskbar;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use windows::core::w;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
@@ -53,6 +55,9 @@ struct App {
     machine: CycleMachine,
     config: config::AppConfig,
     bars: Vec<Bar>,
+    tray: tray_icon::TrayIcon,
+    /// 已落到托盘的图标状态（色相, 是否空心；待机=中性暗灰），仅在变化时重建
+    last_icon: Option<(colors::Rgb, bool)>,
     last_snap: Snapshot,
     last_tick: Instant,
     tick_count: u64,
@@ -63,7 +68,7 @@ struct App {
 }
 
 impl App {
-    fn new(cfg: config::AppConfig, taskbar_created_msg: u32) -> App {
+    fn new(cfg: config::AppConfig, taskbar_created_msg: u32, tray: tray_icon::TrayIcon) -> App {
         let machine = CycleMachine::new(cfg.focus, cfg.short_break, cfg.long_break);
         let bars = Taskbar::refresh_all(cfg.render_all_monitors)
             .into_iter()
@@ -76,6 +81,8 @@ impl App {
             machine,
             config: cfg,
             bars,
+            tray,
+            last_icon: None,
             last_snap: Snapshot::idle(),
             last_tick: Instant::now(),
             tick_count: 0,
@@ -100,25 +107,29 @@ impl App {
         } else {
             GEOMETRY_TICKS
         };
-        if self.geometry_dirty || self.tick_count % geo_period == 0 {
+        if self.geometry_dirty || self.tick_count.is_multiple_of(geo_period) {
             self.refresh_geometry();
         }
 
-        // 仅在快照变化或过渡插值中重绘：暂停时时间冻结、快照不变，跳过无谓重绘
-        let transitioning = self.bars.iter().any(|b| {
+        // 仅在快照变化或有进行中动画（过渡/脉冲/呼吸）时重绘：
+        // 暂停且呼吸平静期以外不制造无谓重绘
+        let animating = self.bars.iter().any(|b| {
             b.overlay
                 .as_ref()
-                .map(|o| o.is_transitioning())
-                .unwrap_or(false)
+                .is_some_and(Overlay::needs_continuous_render)
         });
-        if snap != self.last_snap || transitioning {
+        if snap != self.last_snap || animating {
             self.apply(snap, now);
         }
         self.last_snap = snap;
 
-        // 过渡期提高帧率，保证色彩插值平滑（文档 §4.3）；
+        // 过渡/脉冲等短动画提高帧率保证平滑（文档 §4.3）；12s 慢呼吸用常规帧率即可。
         // 仅在间隔实际变化时才调用 SetTimer，避免重复重置导致丢帧
-        let interval = if transitioning { TICK_FAST_MS } else { TICK_MS };
+        let fast = self
+            .bars
+            .iter()
+            .any(|b| b.overlay.as_ref().is_some_and(Overlay::needs_fast_frames));
+        let interval = if fast { TICK_FAST_MS } else { TICK_MS };
         if interval != self.timer_interval {
             self.timer_interval = interval;
             unsafe {
@@ -149,14 +160,29 @@ impl App {
                 .iter_mut()
                 .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
                 .and_then(|b| b.overlay.take());
-            new_bars.push(Bar { taskbar: tb, overlay });
+            new_bars.push(Bar {
+                taskbar: tb,
+                overlay,
+            });
         }
         self.bars = new_bars;
         self.geometry_dirty = false;
     }
 
-    /// 把状态快照落到任务栏视觉上（文档 §4.2 / §4.3）
+    /// 把状态快照落到任务栏视觉与托盘图标上（文档 §4.2 / §4.3）
     fn apply(&mut self, snap: Snapshot, now: Instant) {
+        // 托盘镜像（文档 §4.2）：运行=阶段色相实心圆点，暂停=空心圆环，待机=中性暗灰
+        let icon_state = if snap.idle {
+            (colors::IDLE_DOT, false)
+        } else {
+            (self.config.palette.for_phase(snap.phase), snap.paused)
+        };
+        if self.last_icon != Some(icon_state) {
+            let _ = self
+                .tray
+                .set_icon(Some(make_icon(icon_state.0, icon_state.1)));
+            self.last_icon = Some(icon_state);
+        }
         // 待机：完全停止绘制（文档 §4.3）
         if snap.idle {
             for b in self.bars.iter_mut() {
@@ -200,9 +226,8 @@ fn main() {
     // 单实例守卫（文档 §3.2：重启即回归待机）
     // GetLastError 必须在 CreateMutexW 后立即检查——
     // 中间任何 Win32/IO 调用都会覆盖线程的 LastError 值
-    let _mutex = match unsafe { CreateMutexW(None, false, w!("Barmato.SingleInstance")) } {
-        Ok(m) => m,
-        Err(_) => return,
+    let Ok(_mutex) = (unsafe { CreateMutexW(None, false, w!("Barmato.SingleInstance")) }) else {
+        return;
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         return;
@@ -246,20 +271,15 @@ fn main() {
     // 资源管理器重启广播（文档 §7）
     let taskbar_created_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
 
-    let mut app = App::new(cfg, taskbar_created_msg);
-    // 上下文挂载到窗口自身（Win32 正统做法），无全局可变状态
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut app as *mut App as isize);
-    }
-
     // 托盘：左键 = 启停切换，右键 = 菜单（仅退出）（文档 §3.1/§3.2）
+    // 图标同时承担状态镜像（文档 §4.2）：初始待机 = 中性暗灰圆点
     let menu = Menu::new();
     let exit_item = MenuItem::with_id(MenuId::new("barmato.exit"), "退出", true, None);
     let exit_id = exit_item.id();
     let _ = menu.append(&exit_item);
-    let Ok(_tray) = TrayIconBuilder::new()
+    let Ok(tray) = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_icon(make_icon())
+        .with_icon(make_icon(colors::IDLE_DOT, false))
         .with_tooltip("Barmato - 左键启停 / 右键退出")
         .with_title("Barmato")
         .with_menu_on_left_click(false) // 左键不弹菜单，专用于 toggle
@@ -267,6 +287,12 @@ fn main() {
     else {
         return;
     };
+
+    let mut app = App::new(cfg, taskbar_created_msg, tray);
+    // 上下文挂载到窗口自身（Win32 正统做法），无全局可变状态
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut app as *mut App as isize);
+    }
 
     unsafe {
         SetTimer(hwnd, TIMER_ID, TICK_MS, None);
@@ -282,17 +308,14 @@ fn main() {
                 }
             }
             // 托盘图标事件：左键 Down → toggle
-            if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Down,
-                    ..
-                } = ev
-                {
-                    let app =
-                        &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
-                    app.on_toggle();
-                }
+            if let Ok(TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Down,
+                ..
+            }) = TrayIconEvent::receiver().try_recv()
+            {
+                let app = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
+                app.on_toggle();
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -336,19 +359,25 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// 程序生成 32×32 托盘图标（低饱和番茄绿圆点），无外部资源依赖
-fn make_icon() -> Icon {
+/// 程序生成 32×32 托盘图标（文档 §4.2 托盘镜像），无外部资源依赖：
+/// - 实心 = 运行（色相随阶段）；空心圆环 = 暂停；中性暗灰 = 待机
+/// - 图标色相对输入色提亮 20%，保证在深色/浅色托盘背景上均可辨
+fn make_icon(color: colors::Rgb, hollow: bool) -> Icon {
     let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let (c, r) = (15.5_f64, 14.0_f64);
+    let c = color.lighten(0.2);
+    let (center, r_out) = (15.5_f64, 13.0_f64);
+    // 空心圆环的内半径；实心时内半径为 0
+    let r_in = if hollow { r_out - 4.0 } else { 0.0 };
     for y in 0..size {
         for x in 0..size {
-            let (dx, dy) = (x as f64 - c, y as f64 - c);
-            if dx * dx + dy * dy <= r * r {
+            let (dx, dy) = (x as f64 - center, y as f64 - center);
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r_out * r_out && d2 >= r_in * r_in {
                 let i = ((y * size + x) * 4) as usize;
-                rgba[i] = 72;
-                rgba[i + 1] = 110;
-                rgba[i + 2] = 90;
+                rgba[i] = c.r;
+                rgba[i + 1] = c.g;
+                rgba[i + 2] = c.b;
                 rgba[i + 3] = 255;
             }
         }

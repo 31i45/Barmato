@@ -7,6 +7,10 @@
 //! - 待机（stage == 8 哨兵值）
 //! - 运行-专注 / 运行-短休 / 运行-长休（由 stage 索引决定）
 //! - 暂停为叠加标记，不新增独立阶段
+//!
+//! 进度语义（文档 §4.2）：快照对外提供**当前阶段**进度（phase_progress）；
+//! 全周期位置由「第几个专注番茄」（pomodoro_index，4 枚刻点的空间编码）表达；
+//! 阶段边界事件通过单调递增的 stage_seq 暴露给渲染层（边界脉冲触发源，§4.3）。
 
 use std::time::Duration;
 
@@ -30,14 +34,20 @@ const STAGE_LAYOUT: [Phase; 8] = [
     Phase::LongBreak,
 ];
 
-/// 对外快照：渲染层唯一需要的信息
+/// 对外快照：渲染层与托盘镜像唯一需要的信息
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Snapshot {
     pub idle: bool,
     pub paused: bool,
     pub phase: Phase,
-    /// 全周期连续进度 0.0..=1.0（细条整条宽度 = 一个完整番茄周期）
-    pub progress: f64,
+    /// 当前阶段进度 0.0..=1.0（细条整条宽度 = 当前阶段时长，文档 §4.2）
+    pub phase_progress: f64,
+    /// 第几个专注番茄：运行态 1..=4（短休/长休保持已完成计数），待机为 0。
+    /// 渲染为刻点的空间模式，绝不显示数字（文档 §1.2 / §4.2）
+    pub pomodoro_index: u8,
+    /// 阶段序号：每次阶段推进（含待机→首个专注）单调递增，
+    /// 渲染层据此探测阶段边界并触发边界脉冲（文档 §4.3）
+    pub stage_seq: u64,
 }
 
 impl Snapshot {
@@ -47,19 +57,21 @@ impl Snapshot {
             idle: true,
             paused: false,
             phase: Phase::Focus,
-            progress: 0.0,
+            phase_progress: 0.0,
+            pomodoro_index: 0,
+            stage_seq: 0,
         }
     }
 }
 
 pub struct CycleMachine {
     durations: [Duration; 8],
-    /// 全周期总时长（8 阶段之和），用于计算连续进度
-    total: Duration,
     /// 0..=8；8 表示待机（周期结束自动回归，文档 §2.1-9）
     stage: usize,
     elapsed: Duration,
     paused: bool,
+    /// 单调递增阶段序号（含启动），快照携带以供边界事件检测
+    stage_seq: u64,
 }
 
 impl CycleMachine {
@@ -72,13 +84,12 @@ impl CycleMachine {
                 Phase::LongBreak => long_break,
             };
         }
-        let total = durations.iter().sum();
         Self {
             durations,
-            total,
             stage: STAGE_LAYOUT.len(),
             elapsed: Duration::ZERO,
             paused: false,
+            stage_seq: 0,
         }
     }
 
@@ -88,6 +99,7 @@ impl CycleMachine {
             self.stage = 0;
             self.elapsed = Duration::ZERO;
             self.paused = false;
+            self.stage_seq += 1; // 待机→首个专注同样是一次阶段边界
         } else {
             self.paused = !self.paused;
         }
@@ -107,6 +119,7 @@ impl CycleMachine {
             }
             self.elapsed -= dur;
             self.stage += 1;
+            self.stage_seq += 1;
         }
         if self.idle() {
             // 周期收尾：自动回归待机（文档 §2.1-9）
@@ -121,22 +134,31 @@ impl CycleMachine {
 
     pub fn snapshot(&self) -> Snapshot {
         if self.idle() {
-            Snapshot::idle()
-        } else {
-            // 全周期连续进度：已完成阶段总时长 + 当前阶段已过时长
-            let completed: Duration = self.durations[..self.stage].iter().sum();
-            let progress = if self.total.is_zero() {
-                1.0
-            } else {
-                ((completed + self.elapsed).as_secs_f64() / self.total.as_secs_f64())
-                    .clamp(0.0, 1.0)
+            // 待机仍携带真实 stage_seq，保证跨周期单调不回绕
+            return Snapshot {
+                stage_seq: self.stage_seq,
+                ..Snapshot::idle()
             };
-            Snapshot {
-                idle: false,
-                paused: self.paused,
-                phase: STAGE_LAYOUT[self.stage],
-                progress,
-            }
+        }
+        let dur = self.durations[self.stage];
+        // 当前阶段进度：细条整条 = 当前阶段时长（文档 §4.2）
+        let phase_progress = if dur.is_zero() {
+            1.0
+        } else {
+            (self.elapsed.as_secs_f64() / dur.as_secs_f64()).clamp(0.0, 1.0)
+        };
+        // 第几个专注番茄：已历经（含当前）的专注阶段个数（刻点空间编码）
+        let pomodoro_index = STAGE_LAYOUT[..=self.stage]
+            .iter()
+            .filter(|p| **p == Phase::Focus)
+            .count() as u8;
+        Snapshot {
+            idle: false,
+            paused: self.paused,
+            phase: STAGE_LAYOUT[self.stage],
+            phase_progress,
+            pomodoro_index,
+            stage_seq: self.stage_seq,
         }
     }
 }
@@ -153,9 +175,25 @@ mod tests {
         CycleMachine::new(F, S, L)
     }
 
+    /// 8 阶段期望序列：阶段、时长、刻点序号（文档 §2.1 / §4.2 刻点空间编码）
+    const STAGES: [(Phase, Duration, u8); 8] = [
+        (Phase::Focus, F, 1),
+        (Phase::ShortBreak, S, 1),
+        (Phase::Focus, F, 2),
+        (Phase::ShortBreak, S, 2),
+        (Phase::Focus, F, 3),
+        (Phase::ShortBreak, S, 3),
+        (Phase::Focus, F, 4),
+        (Phase::LongBreak, L, 4),
+    ];
+
     #[test]
     fn starts_idle() {
-        assert!(machine().snapshot().idle);
+        let s = machine().snapshot();
+        assert!(s.idle);
+        assert_eq!(s.phase_progress, 0.0);
+        assert_eq!(s.pomodoro_index, 0); // 待机无刻点（文档 §4.2）
+        assert_eq!(s.stage_seq, 0);
     }
 
     #[test]
@@ -165,8 +203,10 @@ mod tests {
         let s = m.snapshot();
         assert!(!s.idle && !s.paused);
         assert_eq!(s.phase, Phase::Focus);
-        // 全周期进度从 0.0 开始
-        assert_eq!(s.progress, 0.0);
+        // 阶段进度从 0.0 开始（细条 = 当前阶段，文档 §4.2）
+        assert_eq!(s.phase_progress, 0.0);
+        assert_eq!(s.pomodoro_index, 1); // 第 1 枚刻点亮起
+        assert_eq!(s.stage_seq, 1); // 待机→首个专注也是边界事件
     }
 
     #[test]
@@ -179,40 +219,29 @@ mod tests {
         m.tick(Duration::from_secs(500));
         let s2 = m.snapshot();
         assert!(s1.paused && s2.paused);
-        assert_eq!(s1.progress, s2.progress);
+        assert_eq!(s1.phase_progress, s2.phase_progress);
+        assert_eq!(s1.stage_seq, s2.stage_seq); // 暂停不是阶段边界
     }
 
+    /// 阶段顺序、时长、刻点序号、边界序号全量验证（文档 §2.1 / §4.2 / §4.3）
     #[test]
-    fn stage_order_and_timing() {
+    fn stage_order_timing_and_ticks() {
         let mut m = machine();
         m.toggle();
-        let expected = [
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::LongBreak, L),
-        ];
-        // 全周期连续进度：每个阶段起始处的 progress 应等于
-        // 该阶段之前所有阶段时长之和 / 总时长
-        let total: Duration = F * 4 + S * 3 + L;
-        let mut elapsed_before = Duration::ZERO;
-        for (phase, dur) in expected {
+        let mut expected_seq = 1u64;
+        for (phase, dur, ticks) in STAGES {
             let snap = m.snapshot();
             assert_eq!(snap.phase, phase);
-            // 阶段起始处 progress 应精确等于已完成比例
-            let expected_progress =
-                elapsed_before.as_secs_f64() / total.as_secs_f64();
-            assert!((snap.progress - expected_progress).abs() < 1e-9,
-                "stage {:?}: progress {} != expected {}",
-                phase, snap.progress, expected_progress);
-            elapsed_before += dur;
+            assert_eq!(snap.pomodoro_index, ticks, "phase {:?}", phase);
+            assert_eq!(snap.stage_seq, expected_seq);
+            // 阶段起始处，当前阶段进度精确为 0
+            assert_eq!(snap.phase_progress, 0.0);
             m.tick(dur);
+            expected_seq += 1;
         }
-        assert!(m.snapshot().idle);
+        let end = m.snapshot();
+        assert!(end.idle);
+        assert_eq!(end.stage_seq, expected_seq); // 长休结束也推进了边界序号
     }
 
     #[test]
@@ -224,7 +253,10 @@ mod tests {
         m.toggle(); // 继续
         assert!(!m.snapshot().paused);
         m.tick(F - Duration::from_secs(100));
-        assert_eq!(m.snapshot().phase, Phase::ShortBreak);
+        let s = m.snapshot();
+        assert_eq!(s.phase, Phase::ShortBreak);
+        assert_eq!(s.phase_progress, 0.0);
+        assert_eq!(s.pomodoro_index, 1);
     }
 
     #[test]
@@ -233,76 +265,90 @@ mod tests {
         m.toggle();
         m.tick(F + S + F + S + F + S + F + L + Duration::from_secs(1));
         assert!(m.snapshot().idle);
+        let seq_before = m.snapshot().stage_seq;
         m.toggle();
         let s = m.snapshot();
         assert_eq!(s.phase, Phase::Focus);
-        assert_eq!(s.progress, 0.0);
+        assert_eq!(s.phase_progress, 0.0);
+        assert_eq!(s.pomodoro_index, 1);
+        assert_eq!(s.stage_seq, seq_before + 1); // 重启也是新边界，序号单调不回绕
     }
 
-    /// 全周期进度单调递增验证：每个阶段内部 progress 必须大于阶段起始值
+    /// 当前阶段进度在阶段内部单调递增，且中点约为 0.5
     #[test]
-    fn progress_monotonic_across_cycle() {
+    fn phase_progress_monotonic_within_stage() {
         let mut m = machine();
         m.toggle();
-        // 在每个阶段中间点采样，验证 progress 单调递增
-        let mut prev_progress = 0.0f64;
-        let stages = [
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::LongBreak, L),
-        ];
-        for (phase, dur) in stages {
-            let half = dur / 2;
-            m.tick(half);
-            let snap = m.snapshot();
-            assert_eq!(snap.phase, phase);
-            assert!(snap.progress > prev_progress,
-                "phase {:?}: progress {} should be > {}", phase, snap.progress, prev_progress);
-            prev_progress = snap.progress;
-            m.tick(dur - half);
+        for (phase, dur, _ticks) in STAGES {
+            let quarters = dur / 4;
+            let mut prev = 0.0f64;
+            for k in 1..4 {
+                m.tick(quarters);
+                let snap = m.snapshot();
+                assert_eq!(snap.phase, phase);
+                let expected = k as f64 / 4.0;
+                assert!(
+                    (snap.phase_progress - expected).abs() < 1e-9,
+                    "phase {:?}: progress {} != expected {}",
+                    phase,
+                    snap.phase_progress,
+                    expected
+                );
+                assert!(snap.phase_progress > prev);
+                prev = snap.phase_progress;
+            }
+            m.tick(dur - quarters * 3);
         }
-        // 周期结束后应回归待机
         assert!(m.snapshot().idle);
     }
 
-    /// 验证全周期进度在阶段边界处的连续性：
-    /// 前一阶段结束时的 progress 应等于下一阶段开始时的 progress
+    /// 阶段进度在边界处重置：阶段末尾趋近 1.0，跨入下一阶段后归零，
+    /// 且 stage_seq 恰好 +1（文档 §4.3 边界脉冲触发源）
     #[test]
-    fn progress_continuous_at_stage_boundaries() {
+    fn phase_progress_resets_at_boundaries() {
         let mut m = machine();
         m.toggle();
-        let total: Duration = F * 4 + S * 3 + L;
-        let stages = [
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::ShortBreak, S),
-            (Phase::Focus, F),
-            (Phase::LongBreak, L),
-        ];
-        let mut elapsed_before = Duration::ZERO;
-        for (phase, dur) in stages {
+        for (phase, dur, _ticks) in STAGES {
             // 推进到阶段最后一瞬间
             m.tick(dur - Duration::from_millis(1));
             let snap_end = m.snapshot();
             assert_eq!(snap_end.phase, phase);
-            let expected_end =
-                (elapsed_before + dur - Duration::from_millis(1)).as_secs_f64()
-                    / total.as_secs_f64();
-            assert!((snap_end.progress - expected_end).abs() < 1e-6,
-                "phase {:?} end: progress {} != expected {}",
-                phase, snap_end.progress, expected_end);
-            // 跨越阶段边界
+            let end_expected = (dur - Duration::from_millis(1)).as_secs_f64() / dur.as_secs_f64();
+            assert!((snap_end.phase_progress - end_expected).abs() < 1e-6);
+            // 跨越边界：进度归零、序号 +1
+            let seq_before = snap_end.stage_seq;
             m.tick(Duration::from_millis(1));
-            elapsed_before += dur;
+            let snap_next = m.snapshot();
+            if !snap_next.idle {
+                assert_eq!(snap_next.phase_progress, 0.0);
+            }
+            assert_eq!(snap_next.stage_seq, seq_before + 1);
         }
+        assert!(m.snapshot().idle);
+    }
+
+    /// 单次 tick 跨越多阶段（系统休眠恢复）：一次结算到位，
+    /// 刻点与边界序号同步跳过（文档 §7 优雅降级）
+    #[test]
+    fn multi_stage_skip_in_single_tick() {
+        let mut m = machine();
+        m.toggle();
+        m.tick(F + S + Duration::from_secs(10));
+        let s = m.snapshot();
+        assert_eq!(s.phase, Phase::Focus);
+        assert_eq!(s.pomodoro_index, 2); // 直接进入第 2 个专注番茄
+        assert_eq!(s.stage_seq, 3); // 启动 1 次 + 跳过 2 个阶段
+        assert!((s.phase_progress - 10.0 / F.as_secs_f64()).abs() < 1e-9);
+    }
+
+    /// 零时长配置不 panic、不除零（配置层已拦截，状态机兜底）
+    #[test]
+    fn zero_durations_do_not_panic() {
+        let mut m = CycleMachine::new(Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        m.toggle();
+        let s = m.snapshot();
+        assert_eq!(s.phase_progress, 1.0);
+        m.tick(Duration::from_secs(1));
         assert!(m.snapshot().idle);
     }
 }
