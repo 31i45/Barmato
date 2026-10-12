@@ -1,8 +1,8 @@
 [package]
 name = "barmato"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
-description = "Bar + Tomato — 极简环境式番茄钟：任务栏细条环境反馈，无弹窗、无数字、无声音"
+description = "Bar + Tomato — 极简环境式番茄钟：任务栏整体染色 + 内缘细条环境反馈，无弹窗、无数字、无声音"
 license = "MIT"
 repository = "https://github.com/31i45/Barmato"
 
@@ -14,6 +14,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 softbuffer = "0.4"

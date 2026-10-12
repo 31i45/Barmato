@@ -1,7 +1,7 @@
 //! 渲染绘制模块（文档 §6.4）
 //!
-//! 技术方案（文档 §4.1）：创建独立顶层分层窗口，紧贴任务栏屏幕内侧
-//! 呈现一条 5px 细条（环境感知条），用色彩+进度提供无干扰的环境反馈。
+//! 技术方案（文档 §4.1）：创建独立顶层分层窗口，细条**嵌入任务栏屏幕内侧缘**
+//! 呈现一条 5px 环境感知条（C 方案几何；首选的 D 整体染色由 tint.rs 承担）。
 //! 用 `HWND_TOPMOST` 保持置顶，用 `WS_EX_TRANSPARENT` 实现鼠标穿透，
 //! 用 `WS_EX_NOACTIVATE` 避免抢占焦点。
 //!
@@ -10,9 +10,10 @@
 //! 会返回 NULL（`ERROR_ALREADY_EXISTS`）；`SetParent` 对 `WS_EX_LAYERED` 窗口
 //! 也无法正确建立父子关系。因此采用独立顶层窗口 + 精确 Z 序管理。
 //!
-//! **为何不覆盖任务栏本身**：
-//! 覆盖任务栏会遮挡系统图标，违反文档 §4.1「绝不被遮挡」。
-//! 细条紧贴任务栏外侧（屏幕内侧），既提供环境感知又不干扰任何系统功能。
+//! **为何嵌入任务栏内缘而非悬浮其上方**：
+//! 悬浮线与任务栏无共同区域，格式塔上沦为"孤儿线"（归属歧义、背景被壁纸
+//! 劫持）。嵌入内缘后与任务栏形成共同区域（归属明确、背景可控），Win11
+//! 图标垂直居中留出内缘 padding，细条零功能遮挡；鼠标穿透保证点击原样下达。
 //!
 //! - 底色常亮：运行时细条铺阶段底色，余光即可感知（可感知性）；
 //!   进度用同色相提亮色从左至右匀速叠加，表达**当前阶段**进度（文档 §4.2）。
@@ -114,9 +115,14 @@ impl HasDisplayHandle for SoftbufferDisplay {
 
 /// 紧贴任务栏屏幕内侧的 5px 细条矩形。
 ///
-/// 判定逻辑：
-/// - 水平任务栏（宽 > 高）：top == 0 → 顶部任务栏，细条在其下方；否则 → 底部任务栏，细条在其上方
-/// - 垂直任务栏（高 > 宽）：left == 0 → 左侧任务栏，细条在其右侧；否则 → 右侧任务栏，细条在其左侧
+/// 判定逻辑（嵌入策略，文档 §4.1 C 方案）：细条嵌入任务栏**屏幕内侧缘**，
+/// 与任务栏形成共同区域（归属明确），上/下邻至少一面为任务栏内表面（背景可控）：
+/// - 水平任务栏（宽 > 高）：top == 0 → 顶部任务栏，细条嵌入其下缘；否则 → 底部任务栏，细条嵌入其上缘
+/// - 垂直任务栏（高 > 宽）：left == 0 → 左侧任务栏，细条嵌入其右缘；否则 → 右侧任务栏，细条嵌入其左缘
+///
+/// Win11 任务栏图标垂直居中，内缘侧为 8px+ 纯 padding——细条零功能遮挡，
+/// 且窗口鼠标穿透（WS_EX_TRANSPARENT），padding 区点击原样穿透给任务栏。
+/// Win10 图标近满高，细条轻擦按钮顶边空白非客户区，视觉无感、功能零影响。
 ///
 /// 主屏坐标系原点为 (0,0)，故 top==0 / left==0 可准确区分主屏顶部/左侧任务栏。
 /// 副屏场景下该启发式可能偏差，但副屏默认关闭渲染（文档 §4.1），影响可忽略。
@@ -127,41 +133,41 @@ fn bar_rect(taskbar: RECT) -> Option<RECT> {
         return None;
     }
     let strip = if h > w {
-        // 垂直任务栏（左侧/右侧）
+        // 垂直任务栏（左侧/右侧）：嵌入屏幕内侧缘
         if taskbar.left == 0 {
-            // 左侧任务栏 → 细条在其右侧（屏幕内侧）
+            // 左侧任务栏 → 细条嵌入其右缘
             RECT {
-                left: taskbar.right,
+                left: taskbar.right - BAR_HEIGHT_PX,
                 top: taskbar.top,
-                right: taskbar.right + BAR_HEIGHT_PX,
+                right: taskbar.right,
                 bottom: taskbar.bottom,
             }
         } else {
-            // 右侧任务栏 → 细条在其左侧（屏幕内侧）
+            // 右侧任务栏 → 细条嵌入其左缘
             RECT {
-                left: taskbar.left - BAR_HEIGHT_PX,
+                left: taskbar.left,
                 top: taskbar.top,
-                right: taskbar.left,
+                right: taskbar.left + BAR_HEIGHT_PX,
                 bottom: taskbar.bottom,
             }
         }
     } else {
-        // 水平任务栏（顶部/底部）
+        // 水平任务栏（顶部/底部）：嵌入屏幕内侧缘
         if taskbar.top == 0 {
-            // 顶部任务栏 → 细条在其下方（屏幕内侧）
+            // 顶部任务栏 → 细条嵌入其下缘
             RECT {
                 left: taskbar.left,
-                top: taskbar.bottom,
+                top: taskbar.bottom - BAR_HEIGHT_PX,
                 right: taskbar.right,
-                bottom: taskbar.bottom + BAR_HEIGHT_PX,
+                bottom: taskbar.bottom,
             }
         } else {
-            // 底部任务栏 → 细条在其上方（屏幕内侧）
+            // 底部任务栏 → 细条嵌入其上缘
             RECT {
                 left: taskbar.left,
-                top: taskbar.top - BAR_HEIGHT_PX,
+                top: taskbar.top,
                 right: taskbar.right,
-                bottom: taskbar.top,
+                bottom: taskbar.top + BAR_HEIGHT_PX,
             }
         }
     };
@@ -494,34 +500,49 @@ mod tests {
 
     #[test]
     fn bar_rect_bottom_taskbar() {
-        // 底部任务栏（最常见）：细条在其上方
+        // 底部任务栏（最常见）：细条嵌入其上缘（文档 §4.1 C 方案）
         let tb = rect(0, 912, 1707, 960);
         let strip = bar_rect(tb).unwrap();
-        assert_eq!(strip, rect(0, 907, 1707, 912));
+        assert_eq!(strip, rect(0, 912, 1707, 917));
     }
 
     #[test]
     fn bar_rect_top_taskbar() {
-        // 顶部任务栏：细条在其下方
+        // 顶部任务栏：细条嵌入其下缘
         let tb = rect(0, 0, 1920, 48);
         let strip = bar_rect(tb).unwrap();
-        assert_eq!(strip, rect(0, 48, 1920, 53));
+        assert_eq!(strip, rect(0, 43, 1920, 48));
     }
 
     #[test]
     fn bar_rect_left_taskbar() {
-        // 左侧任务栏：细条在其右侧
+        // 左侧任务栏：细条嵌入其右缘
         let tb = rect(0, 0, 48, 1080);
         let strip = bar_rect(tb).unwrap();
-        assert_eq!(strip, rect(48, 0, 53, 1080));
+        assert_eq!(strip, rect(43, 0, 48, 1080));
     }
 
     #[test]
     fn bar_rect_right_taskbar() {
-        // 右侧任务栏：细条在其左侧
+        // 右侧任务栏：细条嵌入其左缘
         let tb = rect(1872, 0, 1920, 1080);
         let strip = bar_rect(tb).unwrap();
-        assert_eq!(strip, rect(1867, 0, 1872, 1080));
+        assert_eq!(strip, rect(1872, 0, 1877, 1080));
+    }
+
+    /// 细条必须完全位于任务栏矩形内部（嵌入不变量）
+    #[test]
+    fn bar_rect_strip_is_inside_taskbar() {
+        for tb in [
+            rect(0, 912, 1707, 960),
+            rect(0, 0, 1920, 48),
+            rect(0, 0, 48, 1080),
+            rect(1872, 0, 1920, 1080),
+        ] {
+            let s = bar_rect(tb).unwrap();
+            assert!(s.left >= tb.left && s.right <= tb.right);
+            assert!(s.top >= tb.top && s.bottom <= tb.bottom);
+        }
     }
 
     #[test]

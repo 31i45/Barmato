@@ -4,9 +4,10 @@
 //! → 托盘图标（左键启停 / 右键退出）→ 定时驱动周期状态机 → 按快照渲染。
 //! 全部系统复杂度封装在各深模块内部。
 //!
-//! 职责分离不变量（文档 §3.1/§4.2）：
-//! **细条表达当前阶段进度，4 枚刻点以空间模式表达第 N 个专注番茄；
-//! 交互入口为托盘图标左键，托盘图标同步镜像当前状态（阶段色相/暂停空心/待机暗灰）**。
+//! 职责分离不变量（文档 §3.1/§4.1/§4.2）：
+//! **首选渲染 = 任务栏整体染色（色相 = 阶段，慢变量）；嵌入细条 = 阶段进度 + 4 刻点（快变量）；
+//! 染色不可用则静默降级为纯细条，再降级为透明。交互入口为托盘图标左键，
+//! 托盘图标同步镜像当前状态（阶段色相/暂停空心/待机暗灰）**。
 
 #![windows_subsystem = "windows"]
 
@@ -15,6 +16,7 @@ mod config;
 mod cycle;
 mod overlay;
 mod taskbar;
+mod tint;
 
 use std::time::Instant;
 
@@ -45,10 +47,16 @@ const GEOMETRY_TICKS: u64 = 4;
 /// 待机无渲染需求，几何探测降频至约 10 秒一次，极致轻量（文档 §4.3）
 const GEOMETRY_TICKS_IDLE: u64 = 40;
 
-/// 一条任务栏与其覆盖层一一对应（默认仅主屏，文档 §4.1）
+/// 一条任务栏与其渲染器一一对应（默认仅主屏，文档 §4.1）
 struct Bar {
     taskbar: Taskbar,
     overlay: Option<Overlay>,
+    /// 染色可用性（文档 §4.1 降级阶梯）：None=未探测，Some(true)=染色生效，
+    /// Some(false)=平台不支持已永久降级为纯细条（仅几何重建才重探测）
+    tint_ok: Option<bool>,
+    /// 当前已染上的颜色（None=原生外观）：染色是慢变量，仅阶段/主题/几何
+    /// 变化才变色，同色重设徒增 DWM 重合成抖动（§4.3 无闪烁）——按色去重
+    tint_applied: Option<colors::Rgb>,
 }
 
 struct App {
@@ -62,6 +70,8 @@ struct App {
     last_tick: Instant,
     tick_count: u64,
     geometry_dirty: bool,
+    /// 系统任务栏主题（浅色=黑字）：决定染色亮度策略（文档 §4.1 染色自适应）
+    taskbar_light: bool,
     taskbar_created_msg: u32,
     /// 当前定时器间隔；仅在变化时才调用 SetTimer，避免重复重置丢帧
     timer_interval: u32,
@@ -70,13 +80,19 @@ struct App {
 impl App {
     fn new(cfg: config::AppConfig, taskbar_created_msg: u32, tray: tray_icon::TrayIcon) -> App {
         let machine = CycleMachine::new(cfg.focus, cfg.short_break, cfg.long_break);
-        let bars = Taskbar::refresh_all(cfg.render_all_monitors)
+        let bars: Vec<Bar> = Taskbar::refresh_all(cfg.render_all_monitors)
             .into_iter()
             .map(|taskbar| Bar {
                 taskbar,
                 overlay: None,
+                tint_ok: None,
+                tint_applied: None,
             })
             .collect();
+        // 启动自愈：清理上次进程异常退出可能残留的染色（文档 §7 静默修复）
+        for b in &bars {
+            tint::apply(b.taskbar.hwnd, None);
+        }
         App {
             machine,
             config: cfg,
@@ -87,6 +103,7 @@ impl App {
             last_tick: Instant::now(),
             tick_count: 0,
             geometry_dirty: false,
+            taskbar_light: tint::system_taskbar_is_light(),
             taskbar_created_msg,
             timer_interval: TICK_MS,
         }
@@ -154,15 +171,23 @@ impl App {
         let new_tbs = Taskbar::refresh_all(self.config.render_all_monitors);
         let mut new_bars: Vec<Bar> = Vec::with_capacity(new_tbs.len());
         for tb in new_tbs {
-            // 按句柄匹配旧覆盖层：句柄与矩形均未变则复用，否则重建
+            // 按句柄匹配旧覆盖层：句柄与矩形均未变则复用，否则重建；
+            // 句柄变化（任务栏重建）时染色探测也随之重置，下帧重新尝试染色
             let overlay = self
                 .bars
                 .iter_mut()
                 .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
                 .and_then(|b| b.overlay.take());
+            let tint_state = self
+                .bars
+                .iter()
+                .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
+                .map_or((None, None), |b| (b.tint_ok, b.tint_applied));
             new_bars.push(Bar {
                 taskbar: tb,
                 overlay,
+                tint_ok: tint_state.0,
+                tint_applied: tint_state.1,
             });
         }
         self.bars = new_bars;
@@ -183,9 +208,14 @@ impl App {
                 .set_icon(Some(make_icon(icon_state.0, icon_state.1)));
             self.last_icon = Some(icon_state);
         }
-        // 待机：完全停止绘制（文档 §4.3）
+        // 待机：完全停止绘制并恢复任务栏原生外观（文档 §4.1/§4.3）
         if snap.idle {
             for b in self.bars.iter_mut() {
+                if b.tint_applied.is_some() {
+                    tint::apply(b.taskbar.hwnd, None);
+                    b.tint_applied = None;
+                }
+                b.tint_ok = None;
                 if let Some(o) = b.overlay.as_mut() {
                     o.hide();
                 }
@@ -193,7 +223,24 @@ impl App {
             return;
         }
         let target = self.config.palette.for_phase(snap.phase);
+        // 染色目标（文档 §4.1）：阶段色相经系统文字对比度自适应钳制（慢变量通道）
+        let tint_color = colors::ensure_contrast(target, self.taskbar_light);
         for b in self.bars.iter_mut() {
+            // 首选策略 D：任务栏整体染色，仅在目标色变化时调用 FFI（阶段切换/
+            // 主题切换/几何重建才会变色）。探测失败（Some(false)）→ 永久降级为
+            // 纯细条（C），不逐帧重试 FFI；仅几何重建（含资源管理器重启）才重置
+            if b.tint_ok != Some(false) && b.tint_applied != Some(tint_color) {
+                if tint::apply(b.taskbar.hwnd, Some(tint_color)) {
+                    b.tint_ok = Some(true);
+                    b.tint_applied = Some(tint_color);
+                } else {
+                    tint::apply(b.taskbar.hwnd, None);
+                    b.tint_ok = Some(false);
+                    b.tint_applied = None;
+                }
+            }
+            // 细条（快变量通道）：进度填充 + 刻点 + 边界脉冲 + 暂停呼吸，
+            // 染色生效时叠加在任务栏顶缘之上，染色降级时独立承担全部视觉
             // 覆盖层缺失或父任务栏已销毁（资源管理器重启）→ 静默重建（文档 §7）
             let need_new = match b.overlay.as_ref() {
                 None => true,
@@ -210,6 +257,17 @@ impl App {
                 o.show();
             }
             o.render(snap, target, now);
+        }
+    }
+
+    /// 退出前恢复任务栏原生外观（文档 §3.2：退出即放弃周期；§7 不留残迹）
+    fn restore_all_tints(&mut self) {
+        for b in &mut self.bars {
+            if b.tint_applied.is_some() {
+                tint::apply(b.taskbar.hwnd, None);
+                b.tint_applied = None;
+            }
+            b.tint_ok = None;
         }
     }
 }
@@ -304,6 +362,9 @@ fn main() {
             // 菜单事件：退出
             if let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id() == exit_id {
+                    // 退出即不留残迹（文档 §3.2/§7）：先恢复任务栏原生外观
+                    let app = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
+                    app.restore_all_tints();
                     PostQuitMessage(0);
                 }
             }
@@ -342,7 +403,12 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            // 几何可能变化（显示模式/DPI/任务栏重排）；系统主题切换亦经
+            // WM_SETTINGCHANGE 广播 → 重读任务栏主题，并把上次快照归零，
+            // 强制下帧以新主题重应用染色（待机本无染色，快照相等自然跳过）
             app.geometry_dirty = true;
+            app.taskbar_light = tint::system_taskbar_is_light();
+            app.last_snap = Snapshot::idle();
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         m if m != 0 && m == app.taskbar_created_msg => {
@@ -352,6 +418,8 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            // 宿主窗口被销毁（含系统关机路径）同样恢复任务栏原生外观
+            app.restore_all_tints();
             PostQuitMessage(0);
             LRESULT(0)
         }
