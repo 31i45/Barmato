@@ -1,6 +1,6 @@
 [package]
 name = "winmato"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
 description = "Win + Tomato — 极简环境式番茄钟：托盘图标四格可视化（四格 ≡ 4 个番茄），无弹窗、无数字、无声音"
 license = "MIT"
