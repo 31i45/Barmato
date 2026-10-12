@@ -336,6 +336,21 @@ impl Overlay {
         if !self.visible || snap.idle || self.width == 0 || self.height == 0 {
             return;
         }
+        // 每帧重断言 HWND_TOPMOST：窗口打开/关闭时任务栏(Shell_TrayWnd)会
+        // 重新断言自身 TOPMOST 把自己推到 topmost band 顶部，覆盖本 overlay
+        // （overlay 嵌在任务栏矩形内，z 序低于任务栏即被完全遮挡）。
+        // SWP_NOMOVE|SWP_NOSIZE 使此调用仅更新 z 序+显示状态，零几何开销。
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+        }
         self.update_anim_state(snap, now);
         let color = self.resolve_color(snap, target, now);
         if self.draw(snap, color).is_err() {

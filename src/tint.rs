@@ -2,6 +2,8 @@
 //!
 //! 通过 `SetWindowCompositionAttribute`（undocumented 但经 TranslucentTB
 //! 八年、数百万用户实战验证的 user32 导出）把任务栏底色染为当前阶段色相。
+//! 使用 ACCENT_ENABLE_GRADIENT(1) 纯色填充模式——任务栏整体填充为纯色，
+//! 而非 ACCENT_ENABLE_ACRYLICBLURBEHIND(4) 亚克力模糊（Windows 11 上半透明）。
 //! windows-rs 未声明此 API 且未收录于官方 user32 导入库，故经 GetProcAddress
 //! 运行期动态解析——全部系统复杂度内埋本模块，
 //! 调用方只看到 `apply(hwnd, Option<Rgb>) -> bool`。
@@ -25,10 +27,12 @@ const WCA_ACCENT_POLICY: u32 = 19;
 
 /// 恢复系统默认任务栏外观
 const ACCENT_ENABLE_DEFAULT: u32 = 0;
-/// 纯色不透明染色（GradientColor 的 alpha 分量为 FF）
-const ACCENT_ENABLE_ACCENTGRADIENT: u32 = 4;
+/// 纯色填充（ACCENT_ENABLE_GRADIENT）：Windows 8+ 最基础可靠的纯色染色模式，
+/// 任务栏整体填充为 GradientColor 指定的颜色。与值 4（ACCENT_ENABLE_ACRYLICBLURBEHIND
+/// 亚克力模糊）不同——亚克力在 Windows 11 上产生半透明模糊效果而非纯色。
+const ACCENT_ENABLE_GRADIENT: u32 = 1;
 
-/// TranslucentTB 实践验证的 flags：绘制左/上边框，与系统任务栏描边一致
+/// 绘制上边框，与系统任务栏描边一致（TranslucentTB 实践验证）
 const ACCENT_FLAGS_GRADIENT: u32 = 2;
 
 /// SetWindowCompositionAttribute 的函数指针签名
@@ -84,7 +88,7 @@ pub fn apply(hwnd: HWND, tint: Option<Rgb>) -> bool {
     };
     let policy = match tint {
         Some(c) => AccentPolicy {
-            accent_state: ACCENT_ENABLE_ACCENTGRADIENT,
+            accent_state: ACCENT_ENABLE_GRADIENT,
             accent_flags: ACCENT_FLAGS_GRADIENT,
             gradient_color: to_abgr(c),
             animation_id: 0,

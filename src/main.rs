@@ -436,6 +436,12 @@ unsafe extern "system" fn wnd_proc(
             // 强制下帧以新主题重应用染色（待机本无染色，快照相等自然跳过）
             app.geometry_dirty = true;
             app.taskbar_light = tint::system_taskbar_is_light();
+            // 系统事件可能已重置任务栏 accent policy，同色去重缓存必须清除，
+            // 否则 apply_tint 认为已染色而跳过 FFI 调用
+            for b in &mut app.bars {
+                b.tint_applied = None;
+                b.tint_ok = None;
+            }
             app.last_snap = Snapshot::idle();
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -443,6 +449,9 @@ unsafe extern "system" fn wnd_proc(
             // 资源管理器重启：强制重建任务栏几何与覆盖层
             app.geometry_dirty = true;
             app.refresh_geometry();
+            // 新 HWND 的 tint_applied 已在 refresh_geometry 中归 None，
+            // 但 last_snap 可能与下帧相同导致 apply 不被调用 → 强制归零
+            app.last_snap = Snapshot::idle();
             LRESULT(0)
         }
         WM_DESTROY => {

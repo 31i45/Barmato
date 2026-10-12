@@ -2,7 +2,7 @@
 
 > Bar + Tomato — 极简环境式番茄钟 for Windows
 >
-> 版本：1.1（对应 Rust 1.98 / 37 项测试全绿 / clippy 零警告）
+> 版本：1.3（对应 Rust 1.98 / 37 项测试全绿 / clippy 零警告）
 >
 > 配套规范：《Barmato 完整开发需求文档（AI 编程专用｜极简环境式正式版）》（下称"需求文档"，本文档以 §N 引用其章节）
 
@@ -129,7 +129,7 @@ pub struct Snapshot {
 | 职责 | 把 `Snapshot` + 阶段底色翻译为 5px 细条像素；全部动画状态机内埋于此 |
 | 窗口 | 独立顶层 `WS_POPUP` + `WS_EX_LAYERED \| WS_EX_TRANSPARENT \| WS_EX_NOACTIVATE \| WS_EX_TOOLWINDOW` |
 | 透明 | `SetLayeredWindowAttributes` + color-key（`#FF00FF`）→ 该色像素完全透明，透出已染色的任务栏底色（D 生效时）或原生底色（降级时） |
-| Z 序 | `HWND_TOPMOST`；鼠标穿透（`WS_EX_TRANSPARENT`）→ 系统图标与交互永不受影响（§4.1） |
+| Z 序 | `HWND_TOPMOST`，且 `render()` 每帧重断言（窗口打开/关闭时任务栏重新断言自身 TOPMOST 会覆盖本 overlay，必须每帧抢回）；鼠标穿透（`WS_EX_TRANSPARENT`）→ 系统图标与交互永不受影响（§4.1） |
 | 光栅 | softbuffer 软件光栅化，无 GPU/浏览器依赖 |
 
 **几何自适应**（`bar_rect`，嵌入策略，需求文档 §4.1）：细条**嵌入任务栏屏幕内侧缘**——底部任务栏→顶缘；顶部→下缘；左侧→右缘；右侧→左缘。不变量「细条完全位于任务栏矩形内部」由测试钉死。与任务栏形成共同区域（格式塔归属明确），Win11 图标垂直居中留出内缘 padding，零功能遮挡；鼠标穿透保证点击原样下达。主屏坐标系原点 (0,0) 保证 top==0 / left==0 判定精确。
@@ -199,7 +199,7 @@ Snapshot + 阶段底色
 | 项 | 内容 |
 |----|------|
 | 职责 | 把阶段色相落到任务栏整体底色 + 主题检测；对上层仅暴露 `apply(hwnd, Option<Rgb>) -> bool` 与 `system_taskbar_is_light()` 两个浅接口，全部 FFI 复杂度内埋 |
-| API | `SetWindowCompositionAttribute` + `WCA_ACCENT_POLICY(19)` + `ACCENT_ENABLE_ACCENTGRADIENT(4)`（undocumented；TranslucentTB 八年、数百万用户实战验证） |
+| API | `SetWindowCompositionAttribute` + `WCA_ACCENT_POLICY(19)` + `ACCENT_ENABLE_GRADIENT(1)` 纯色填充（undocumented；TranslucentTB 八年、数百万用户实战验证）。值 1 而非值 4——值 4 是 `ACCENT_ENABLE_ACRYLICBLURBEHIND` 亚克力模糊，Windows 11 上产生半透明效果而非纯色 |
 | 解析 | 未收录于官方 user32 导入库（静态链接 LNK2019）→ `GetProcAddress` 运行期动态解析，`OnceLock` 进程级缓存函数指针（首调后零 FFI 开销）；解析失败 → `apply` 返回 false → 上层永久降级为嵌入细条（C 方案） |
 | 颜色格式 | AABBGGRR，alpha=FF 不透明（仅用不透明染色保证对比度确定性）；纯函数 `to_abgr` 测试锁定字节序 |
 | 恢复 | `apply(hwnd, None)` = `ACCENT_ENABLE_DEFAULT` 恢复系统默认外观（待机/退出/降级前调用，幂等） |
@@ -235,8 +235,8 @@ tick(Δt) → snapshot()
 
 | 消息 | 响应 |
 |------|------|
-| `WM_DISPLAYCHANGE` / `WM_SETTINGCHANGE` | 置 `geometry_dirty`；重读任务栏主题（主题切换经此广播）；上次快照归零，强制下帧以新主题重应用染色 |
-| `TaskbarCreated`（explorer 重启） | 立即 `refresh_geometry()`，覆盖层与染色探测按句柄+矩形匹配复用或重置 |
+| `WM_DISPLAYCHANGE` / `WM_SETTINGCHANGE` | 置 `geometry_dirty`；重读任务栏主题；重置所有 Bar 的 `tint_applied`/`tint_ok`（系统事件可能已重置 accent policy，同色去重缓存必须清除）；上次快照归零，强制下帧重应用染色 |
+| `TaskbarCreated`（explorer 重启） | 立即 `refresh_geometry()`（新 HWND 的 `tint_applied` 自动归 None）；上次快照归零，强制下帧 `apply` 向新 HWND 染色 |
 | `WM_TIMER` | `on_timer` |
 
 **几何重建策略**：按 `hwnd + rect` 精确匹配旧 Bar，单次遍历取出覆盖层与染色状态——均未变则复用（零开销），任一变化才重建；句柄变化（任务栏重建）时染色探测随之重置，下帧重新尝试染色。
@@ -344,6 +344,9 @@ tick(Δt) → snapshot()
 9. **`OnceLock` 缓存函数指针而非每次解析**：`resolve_wca()` 的 `GetModuleHandleW` + `GetProcAddress` 在进程生命期内结果恒定，`OnceLock::get_or_init` 保证只执行一次，后续调用直接读缓存——零 FFI 开销。
 10. **`FindWindowW` 而非 `EnumWindows`**：任务栏类名为已知常量，`FindWindowW` O(1) 精确查找替代 O(n) 全量枚举 + 逐窗口类名比对 + `String` 堆分配——几何探测从每秒 O(n) 降到 O(1)。
 11. **`apply` 职责拆分为关联函数**：`apply_tint` 和 `render_strip` 不访问 `self`，作为关联函数而非方法——避免 `self.bars.iter_mut()` 迭代期间的 `&mut self` 借用冲突，同时让每个函数单一职责可独立审视。
+12. **`ACCENT_ENABLE_GRADIENT(1)` 而非 `ACCENT_ENABLE_ACRYLICBLURBEHIND(4)`**：值 1 是最基础可靠的纯色填充模式（Windows 8+），任务栏整体填充为纯色；值 4 是亚克力模糊，Windows 10 上 alpha=FF 时表现为纯色，但 Windows 11 上仍产生半透明模糊效果——与「整体染色」的纯色目标冲突。
+13. **`render()` 每帧重断言 `HWND_TOPMOST`**：窗口打开/关闭时任务栏(Shell_TrayWnd)重新断言自身 TOPMOST 把自己推到 topmost band 顶部，覆盖嵌在其矩形内的 overlay——仅靠 `show()` 一次性设置 TOPMOST 不够，必须在 `render()` 每帧用 `SetWindowPos(HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE)` 抢回 z 序。开销极低（仅 z 序更新），4-20fps 下无感。
+14. **系统事件后重置 `tint_applied` 缓存**：`WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE` 可能导致系统重置任务栏 accent policy，但同色去重缓存仍认为「已染色」而跳过 FFI 调用——必须在消息处理器中显式清除 `tint_applied`/`tint_ok`，强制下帧重新调用 `SetWindowCompositionAttribute`。
 
 ## 11. 不变量总清单（改代码前必读）
 
@@ -358,3 +361,4 @@ tick(Δt) → snapshot()
 9. 渲染降级阶梯单调：D 染色 → C 嵌入细条 → 待机透明，**永不回弹**（仅几何重建才重置探测）；待机与退出必恢复任务栏原生外观
 10. 染色色相必经 WCAG 钳制（系统文字对比度 ≥4.5:1），且为慢变量按色去重——绝不在动画帧率下重复调用 FFI
 11. 染色生效时细条底色 = `tint_color`（与任务栏同色），降级时 = `target`（原色，最大可见度）——绝不在染色生效时让细条色相与任务栏不一致
+12. overlay 的 TOPMOST z 序每帧重断言——绝不依赖 `show()` 的一次性设置，窗口打开/关闭后任务栏重排 z 序会覆盖 overlay

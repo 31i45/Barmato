@@ -114,8 +114,8 @@ C 嵌入任务栏内缘（降级方案）         D 任务栏整体染色（终�
 ```
 main.rs      薄主线：消息循环 + 托盘事件 + 定时驱动 + 染色调度与降级阶梯
 cycle.rs     周期状态机：纯业务逻辑，零 Windows API 依赖
-overlay.rs   渲染层：嵌入任务栏内缘的分层透明窗口 + softbuffer 软件光栅化
-tint.rs      染色层：SetWindowCompositionAttribute 动态解析 + OnceLock 缓存 + 主题检测
+overlay.rs   渲染层：嵌入任务栏内缘的分层透明窗口 + softbuffer 软件光栅化，每帧重断言 TOPMOST
+tint.rs      染色层：ACCENT_ENABLE_GRADIENT 纯色填充 + GetProcAddress 动态解析 + OnceLock 缓存 + 主题检测
 taskbar.rs   几何检测：FindWindowW O(1) 定位任务栏句柄与矩形
 colors.rs    色彩模块：RGB 运算、配色、插值、WCAG 对比度钳制
 config.rs    配置加载：只读 JSON，静默回退
@@ -126,7 +126,7 @@ config.rs    配置加载：只读 JSON，静默回退
 ## 技术栈
 
 - **Rust** + **windows-rs 0.58** — 原生 Windows API
-- **SetWindowCompositionAttribute** — 任务栏整体染色（user32 undocumented 导出，运行期 `GetProcAddress` 动态解析，TranslucentTB 八年实战验证）
+- **SetWindowCompositionAttribute** — 任务栏整体染色（`ACCENT_ENABLE_GRADIENT` 纯色填充，user32 undocumented 导出，运行期 `GetProcAddress` 动态解析，TranslucentTB 八年实战验证）
 - **softbuffer 0.4** — 软件光栅化，无 GPU 依赖
 - **tray-icon 0.19** — 系统托盘
 - **serde / serde_json** — 轻量配置解析
