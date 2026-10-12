@@ -171,23 +171,20 @@ impl App {
         let new_tbs = Taskbar::refresh_all(self.config.render_all_monitors);
         let mut new_bars: Vec<Bar> = Vec::with_capacity(new_tbs.len());
         for tb in new_tbs {
-            // 按句柄匹配旧覆盖层：句柄与矩形均未变则复用，否则重建；
+            // 单次遍历：按句柄+矩形匹配旧 Bar，取出覆盖层与染色状态
             // 句柄变化（任务栏重建）时染色探测也随之重置，下帧重新尝试染色
-            let overlay = self
+            let (overlay, tint_ok, tint_applied) = self
                 .bars
                 .iter_mut()
                 .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
-                .and_then(|b| b.overlay.take());
-            let tint_state = self
-                .bars
-                .iter()
-                .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
-                .map_or((None, None), |b| (b.tint_ok, b.tint_applied));
+                .map_or((None, None, None), |b| {
+                    (b.overlay.take(), b.tint_ok, b.tint_applied)
+                });
             new_bars.push(Bar {
                 taskbar: tb,
                 overlay,
-                tint_ok: tint_state.0,
-                tint_applied: tint_state.1,
+                tint_ok,
+                tint_applied,
             });
         }
         self.bars = new_bars;
@@ -196,7 +193,22 @@ impl App {
 
     /// 把状态快照落到任务栏视觉与托盘图标上（文档 §4.2 / §4.3）
     fn apply(&mut self, snap: Snapshot, now: Instant) {
-        // 托盘镜像（文档 §4.2）：运行=阶段色相实心圆点，暂停=空心圆环，待机=中性暗灰
+        self.update_tray_icon(snap);
+        if snap.idle {
+            self.restore_idle();
+            return;
+        }
+        let target = self.config.palette.for_phase(snap.phase);
+        let tint_color = colors::ensure_contrast(target, self.taskbar_light);
+        for b in self.bars.iter_mut() {
+            Self::apply_tint(b, tint_color);
+            Self::render_strip(b, snap, target, tint_color, now);
+        }
+    }
+
+    /// 托盘镜像（文档 §4.2）：运行=阶段色相实心圆点，暂停=空心圆环，待机=中性暗灰。
+    /// 仅在状态变化时重建图标，避免每帧分配。
+    fn update_tray_icon(&mut self, snap: Snapshot) {
         let icon_state = if snap.idle {
             (colors::IDLE_DOT, false)
         } else {
@@ -208,61 +220,69 @@ impl App {
                 .set_icon(Some(make_icon(icon_state.0, icon_state.1)));
             self.last_icon = Some(icon_state);
         }
-        // 待机：完全停止绘制并恢复任务栏原生外观（文档 §4.1/§4.3）
-        if snap.idle {
-            for b in self.bars.iter_mut() {
-                if b.tint_applied.is_some() {
-                    tint::apply(b.taskbar.hwnd, None);
-                    b.tint_applied = None;
-                }
-                b.tint_ok = None;
-                if let Some(o) = b.overlay.as_mut() {
-                    o.hide();
-                }
-            }
-            return;
-        }
-        let target = self.config.palette.for_phase(snap.phase);
-        // 染色目标（文档 §4.1）：阶段色相经系统文字对比度自适应钳制（慢变量通道）
-        let tint_color = colors::ensure_contrast(target, self.taskbar_light);
+    }
+
+    /// 待机：完全停止绘制并恢复任务栏原生外观（文档 §4.1/§4.3）
+    fn restore_idle(&mut self) {
         for b in self.bars.iter_mut() {
-            // 首选策略 D：任务栏整体染色，仅在目标色变化时调用 FFI（阶段切换/
-            // 主题切换/几何重建才会变色）。探测失败（Some(false)）→ 永久降级为
-            // 纯细条（C），不逐帧重试 FFI；仅几何重建（含资源管理器重启）才重置
-            if b.tint_ok != Some(false) && b.tint_applied != Some(tint_color) {
-                if tint::apply(b.taskbar.hwnd, Some(tint_color)) {
-                    b.tint_ok = Some(true);
-                    b.tint_applied = Some(tint_color);
-                } else {
-                    tint::apply(b.taskbar.hwnd, None);
-                    b.tint_ok = Some(false);
-                    b.tint_applied = None;
-                }
+            if b.tint_applied.is_some() {
+                tint::apply(b.taskbar.hwnd, None);
+                b.tint_applied = None;
             }
-            // 细条（快变量通道）：进度填充 + 刻点 + 边界脉冲 + 暂停呼吸，
-            // 染色生效时底色须与任务栏染色一致（§4.2 细条同色底色），
-            // 染色降级时用原始阶段色独立承担全部视觉（最大可见度）
-            let strip_color = if b.tint_applied.is_some() {
-                tint_color
-            } else {
-                target
-            };
-            let need_new = match b.overlay.as_ref() {
-                None => true,
-                Some(o) => !o.is_alive(),
-            };
-            if need_new {
-                b.overlay = Overlay::new(b.taskbar.hwnd);
+            b.tint_ok = None;
+            if let Some(o) = b.overlay.as_mut() {
+                o.hide();
             }
-            let Some(o) = b.overlay.as_mut() else {
-                continue; // 创建失败：静默降级，无渲染但不报错
-            };
-            // 渲染失败被降级隐藏后，这里自动重新显示恢复（文档 §7 静默恢复）
-            if !o.is_visible() {
-                o.show();
-            }
-            o.render(snap, strip_color, now);
         }
+    }
+
+    /// 首选策略 D：任务栏整体染色。仅在目标色变化时调用 FFI（阶段切换/
+    /// 主题切换/几何重建才会变色）。探测失败 → 永久降级为纯细条（C），
+    /// 不逐帧重试；仅几何重建才重置探测（文档 §4.1 降级阶梯）
+    fn apply_tint(b: &mut Bar, tint_color: colors::Rgb) {
+        if b.tint_ok != Some(false) && b.tint_applied != Some(tint_color) {
+            if tint::apply(b.taskbar.hwnd, Some(tint_color)) {
+                b.tint_ok = Some(true);
+                b.tint_applied = Some(tint_color);
+            } else {
+                tint::apply(b.taskbar.hwnd, None);
+                b.tint_ok = Some(false);
+                b.tint_applied = None;
+            }
+        }
+    }
+
+    /// 细条（快变量通道）：进度填充 + 刻点 + 边界脉冲 + 暂停呼吸。
+    /// 染色生效时底色 = tint_color（§4.2 细条同色底色），
+    /// 降级时 = target 原色（最大可见度）。
+    /// 覆盖层缺失或父窗口已销毁 → 静默重建（文档 §7）
+    fn render_strip(
+        b: &mut Bar,
+        snap: Snapshot,
+        target: colors::Rgb,
+        tint_color: colors::Rgb,
+        now: Instant,
+    ) {
+        let strip_color = if b.tint_applied.is_some() {
+            tint_color
+        } else {
+            target
+        };
+        let need_new = match b.overlay.as_ref() {
+            None => true,
+            Some(o) => !o.is_alive(),
+        };
+        if need_new {
+            b.overlay = Overlay::new(b.taskbar.hwnd);
+        }
+        let Some(o) = b.overlay.as_mut() else {
+            return; // 创建失败：静默降级，无渲染但不报错
+        };
+        // 渲染失败被降级隐藏后，这里自动重新显示恢复（文档 §7 静默恢复）
+        if !o.is_visible() {
+            o.show();
+        }
+        o.render(snap, strip_color, now);
     }
 
     /// 退出前恢复任务栏原生外观（文档 §3.2：退出即放弃周期；§7 不留残迹）

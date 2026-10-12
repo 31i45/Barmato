@@ -5,13 +5,13 @@
 //!
 //! 交互模型已迁移至托盘图标（文档 §3.1），本模块不再负责空白区域判定，
 //! 仅提供任务栏句柄与矩形——渲染覆盖层所需的唯一信息。
+//!
+//! 使用 `FindWindowW` O(1) 精确查找（类名为已知常量），替代 `EnumWindows`
+//! 全量枚举 + 逐窗口 `GetClassNameW` + `String::from_utf16_lossy` 堆分配。
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowRect};
-
-/// 主/副屏任务栏窗口类名
-const PRIMARY_CLASS: &str = "Shell_TrayWnd";
-const SECONDARY_CLASS: &str = "Shell_SecondaryTrayWnd";
+use windows::core::w;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
 
 pub struct Taskbar {
     pub hwnd: HWND,
@@ -22,25 +22,23 @@ impl Taskbar {
     /// 探测所有需要渲染的任务栏。
     /// `all_monitors=false` 时仅返回主屏任务栏（文档 §4.1 默认）。
     pub fn refresh_all(all_monitors: bool) -> Vec<Taskbar> {
-        let mut found: Vec<(HWND, bool)> = Vec::new(); // (hwnd, is_primary)
-        unsafe {
-            let _ = EnumWindows(
-                Some(enum_taskbars),
-                LPARAM(&mut found as *mut Vec<(HWND, bool)> as isize),
-            );
+        let mut result = Vec::new();
+        // 主屏任务栏：FindWindowW O(1) 精确查找，零堆分配
+        if let Some(tb) = Self::from_class(w!("Shell_TrayWnd")) {
+            result.push(tb);
         }
-        // 主屏任务栏排前
-        found.sort_by_key(|(_, is_primary)| !*is_primary);
-        if !all_monitors {
-            found.truncate(1);
+        if all_monitors {
+            if let Some(tb) = Self::from_class(w!("Shell_SecondaryTrayWnd")) {
+                result.push(tb);
+            }
         }
-        found
-            .into_iter()
-            .filter_map(|(hwnd, _)| Taskbar::from_hwnd(hwnd))
-            .collect()
+        result
     }
 
-    fn from_hwnd(hwnd: HWND) -> Option<Taskbar> {
+    /// 按窗口类名查找任务栏并获取其屏幕矩形。
+    /// 类名不存在/窗口无有效矩形 → None（静默跳过，文档 §7）。
+    fn from_class(class: windows::core::PCWSTR) -> Option<Taskbar> {
+        let hwnd = unsafe { FindWindowW(class, None) }.ok()?;
         let mut rect = RECT::default();
         if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
             return None;
@@ -50,18 +48,4 @@ impl Taskbar {
         }
         Some(Taskbar { hwnd, rect })
     }
-}
-
-/// 枚举顶层窗口，收集主/副屏任务栏
-unsafe extern "system" fn enum_taskbars(hwnd: HWND, lp: LPARAM) -> BOOL {
-    let out = &mut *(lp.0 as *mut Vec<(HWND, bool)>);
-    let mut name = [0u16; 64];
-    let n = GetClassNameW(hwnd, &mut name).max(0);
-    let class = String::from_utf16_lossy(&name[..n as usize]);
-    if class == PRIMARY_CLASS {
-        out.push((hwnd, true));
-    } else if class == SECONDARY_CLASS {
-        out.push((hwnd, false));
-    }
-    BOOL(1)
 }

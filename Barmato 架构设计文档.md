@@ -189,9 +189,9 @@ Snapshot + 阶段底色
 
 ### 3.5 taskbar.rs — 任务栏几何探测（文档 §6.2）
 
-- `EnumWindows` 按类名收集：主屏 `Shell_TrayWnd`、副屏 `Shell_SecondaryTrayWnd`
+- `FindWindowW` 按已知类名 O(1) 精确查找：主屏 `Shell_TrayWnd`、副屏 `Shell_SecondaryTrayWnd`——替代 `EnumWindows` 全量枚举 + 逐窗口 `GetClassNameW` + `String::from_utf16_lossy` 堆分配
 - 只产出渲染覆盖层需要的**唯一信息**：`hwnd + rect`（交互已迁移至托盘，不再做空白区判定）
-- 主屏排序在前；`all_monitors=false` 时截断为仅主屏（§4.1 默认，砍掉多屏边界 case）
+- `all_monitors=false` 时仅查主屏（§4.1 默认，砍掉多屏边界 case）；`true` 时追加副屏查找
 - 无效矩形（翻转/零尺寸）过滤返回 None
 
 ### 3.6 tint.rs — 任务栏整体染色（首选策略 D，需求文档 §4.1）
@@ -200,7 +200,7 @@ Snapshot + 阶段底色
 |----|------|
 | 职责 | 把阶段色相落到任务栏整体底色 + 主题检测；对上层仅暴露 `apply(hwnd, Option<Rgb>) -> bool` 与 `system_taskbar_is_light()` 两个浅接口，全部 FFI 复杂度内埋 |
 | API | `SetWindowCompositionAttribute` + `WCA_ACCENT_POLICY(19)` + `ACCENT_ENABLE_ACCENTGRADIENT(4)`（undocumented；TranslucentTB 八年、数百万用户实战验证） |
-| 解析 | 未收录于官方 user32 导入库（静态链接 LNK2019）→ `GetProcAddress` 运行期动态解析；解析失败 → `apply` 返回 false → 上层永久降级为嵌入细条（C 方案） |
+| 解析 | 未收录于官方 user32 导入库（静态链接 LNK2019）→ `GetProcAddress` 运行期动态解析，`OnceLock` 进程级缓存函数指针（首调后零 FFI 开销）；解析失败 → `apply` 返回 false → 上层永久降级为嵌入细条（C 方案） |
 | 颜色格式 | AABBGGRR，alpha=FF 不透明（仅用不透明染色保证对比度确定性）；纯函数 `to_abgr` 测试锁定字节序 |
 | 恢复 | `apply(hwnd, None)` = `ACCENT_ENABLE_DEFAULT` 恢复系统默认外观（待机/退出/降级前调用，幂等） |
 | 主题 | 注册表 `AppsUseLightTheme`（DWORD）判定浅色/深色；读取失败按深色处理（Windows 出厂默认） |
@@ -239,7 +239,18 @@ tick(Δt) → snapshot()
 | `TaskbarCreated`（explorer 重启） | 立即 `refresh_geometry()`，覆盖层与染色探测按句柄+矩形匹配复用或重置 |
 | `WM_TIMER` | `on_timer` |
 
-**几何重建策略**：按 `hwnd + rect` 精确匹配旧覆盖层——均未变则复用（零开销），任一变化才重建；句柄变化（任务栏重建）时染色探测随之重置，下帧重新尝试染色。
+**几何重建策略**：按 `hwnd + rect` 精确匹配旧 Bar，单次遍历取出覆盖层与染色状态——均未变则复用（零开销），任一变化才重建；句柄变化（任务栏重建）时染色探测随之重置，下帧重新尝试染色。
+
+**`apply` 方法职责拆分**（单一职责原则）：
+
+| 方法 | 职责 |
+|------|------|
+| `update_tray_icon(snap)` | 托盘图标镜像，仅状态变化时重建 |
+| `restore_idle()` | 待机恢复：清除染色 + 隐藏覆盖层 + 重置探测 |
+| `apply_tint(b, tint_color)` | 关联函数：单 Bar 染色去重与降级探测 |
+| `render_strip(b, snap, target, tint_color, now)` | 关联函数：单 Bar 覆盖层生命周期 + 细条渲染 |
+
+`apply` 本身仅编排：调 `update_tray_icon` → 若待机调 `restore_idle` 返回 → 否则逐 Bar 调 `apply_tint` + `render_strip`。`apply_tint` 和 `render_strip` 不访问 `self`，作为关联函数避免迭代器借用冲突。
 
 ## 4. 核心时序：一次左键点击的生命周期
 
@@ -330,6 +341,9 @@ tick(Δt) → snapshot()
 6. **同色去重（`tint_applied` 缓存）**：染色是慢变量，动画帧率下重发同一颜色徒增 DWM 重合成调用；按色比较跳过，语义零损失。
 7. **细条底色跟随染色而非原色**：染色生效时细条用 `tint_color`（WCAG 钳制后的色），满足 §4.2「细条同色底色」——否则 ShortBreak/LongBreak 默认配色在深色任务栏上细条比任务栏亮（原色对比度 < 4.5:1 被压暗），视觉割裂。降级时用 `target` 原色，保证原生任务栏上的最大可见度。
 8. **退出路径 `continue` 而非 fall-through**：`restore_all_tints()` + `PostQuitMessage(0)` 后必须跳过本帧 `DispatchMessageW`——若 `msg` 是 `WM_TIMER`，`on_timer→apply` 会重新染色，进程退出后残留任务栏被染色的残迹（§7 不留残迹）。
+9. **`OnceLock` 缓存函数指针而非每次解析**：`resolve_wca()` 的 `GetModuleHandleW` + `GetProcAddress` 在进程生命期内结果恒定，`OnceLock::get_or_init` 保证只执行一次，后续调用直接读缓存——零 FFI 开销。
+10. **`FindWindowW` 而非 `EnumWindows`**：任务栏类名为已知常量，`FindWindowW` O(1) 精确查找替代 O(n) 全量枚举 + 逐窗口类名比对 + `String` 堆分配——几何探测从每秒 O(n) 降到 O(1)。
+11. **`apply` 职责拆分为关联函数**：`apply_tint` 和 `render_strip` 不访问 `self`，作为关联函数而非方法——避免 `self.bars.iter_mut()` 迭代期间的 `&mut self` 借用冲突，同时让每个函数单一职责可独立审视。
 
 ## 11. 不变量总清单（改代码前必读）
 

@@ -13,6 +13,8 @@
 //! 架构意义（第一性原理）：指示器寄生在宿主（任务栏）上，宿主的生命周期
 //! 行为（全屏隐藏、自动隐藏、多显示器）被自动继承，无需任何探测逻辑。
 
+use std::sync::OnceLock;
+
 use crate::colors::Rgb;
 use windows::core::{s, w};
 use windows::Win32::Foundation::{BOOL, HWND};
@@ -32,6 +34,10 @@ const ACCENT_FLAGS_GRADIENT: u32 = 2;
 /// SetWindowCompositionAttribute 的函数指针签名
 type WcaFn = unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> BOOL;
 
+/// 进程级缓存：函数指针在生命期内恒定，OnceLock 保证只解析一次，
+/// 后续调用零 FFI 开销（GetModuleHandleW + GetProcAddress 不再重复）。
+static WCA: OnceLock<Option<WcaFn>> = OnceLock::new();
+
 #[repr(C)]
 struct AccentPolicy {
     accent_state: u32,
@@ -49,18 +55,20 @@ struct WindowCompositionAttribData {
 }
 
 /// 运行期解析 SetWindowCompositionAttribute：该 undocumented API 未收录于
-/// 官方 user32 导入库（静态链接报 LNK2019），必须经 GetProcAddress 动态获取
-/// （TranslucentTB 八年验证的同款做法）。解析失败（精简系统/Wine）→ None
-/// → 上层永久降级为细条（文档 §4.1 降级阶梯），风险自然驯化为增强项。
+/// 官方 user32 导入库（静态链接报 LNK2019），经 GetProcAddress 动态获取。
+/// 函数指针在进程生命期内恒定，OnceLock 缓存后后续调用零 FFI 开销。
+/// 解析失败（精简系统/Wine）→ None → 上层永久降级为细条（§4.1 降级阶梯）。
 fn resolve_wca() -> Option<WcaFn> {
-    // SAFETY: user32 模块在本进程必然已加载（消息循环依赖它）；
-    // 返回的函数指针仅在拥有任务栏 HWND 的消息线程调用，无并发共享。
-    unsafe {
-        let user32 = GetModuleHandleW(w!("user32")).ok()?;
-        let f: WcaFn =
-            core::mem::transmute(GetProcAddress(user32, s!("SetWindowCompositionAttribute"))?);
-        Some(f)
-    }
+    *WCA.get_or_init(|| {
+        // SAFETY: user32 模块在本进程必然已加载（消息循环依赖它）；
+        // 返回的函数指针仅在拥有任务栏 HWND 的消息线程调用，无并发共享。
+        unsafe {
+            let user32 = GetModuleHandleW(w!("user32")).ok()?;
+            let f: WcaFn =
+                core::mem::transmute(GetProcAddress(user32, s!("SetWindowCompositionAttribute"))?);
+            Some(f)
+        }
+    })
 }
 
 /// RGB → AABBGGRR（alpha = FF，不透明）。纯函数，供测试锁定字节序。
