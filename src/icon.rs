@@ -293,32 +293,6 @@ fn draw_pause_glyph(buf: &mut [u8], size: i32, color: Rgb, alpha: u8) {
     }
 }
 
-/// 应用图标（exe 资源）画布的 RGBA 像素：四格空心「待填充」。
-///
-/// 与托盘待机同一渲染核心、同一几何与语义；唯一差异是边线宽度随画布
-/// 比例取整加粗（`brand_line_w`）——应用图标会在资源管理器等场景大幅
-/// 放大显示，恒定 1px 在大尺寸下退化为不可见的发丝线。逐尺寸重推几何，
-/// 加粗后边缘依然锐利无模糊（examples/gen_icon 使用）。
-pub fn app_icon_rgba(size: i32, palette: &Palette) -> Vec<u8> {
-    let specs = plan(Snapshot::idle(), palette);
-    render_buf(
-        size,
-        &specs,
-        palette.idle_outline(),
-        palette.focus,
-        255,
-        false,
-        brand_line_w(size),
-    )
-}
-
-/// 应用图标边线宽：以 32px 档标定为 1px，随画布比例取整加粗
-/// （16/24/32 → 1、48/64 → 2、128 → 4、256 → 8），
-/// 任何尺寸下四格空心轮廓都完整显现。
-fn brand_line_w(size: i32) -> i32 {
-    ((size as f64) / 32.0).round().max(1.0) as i32
-}
-
 /// 托盘图标渲染器：封装全部动画状态与画布尺寸，对外只暴露 render()。
 pub struct IconRenderer {
     size: i32,
@@ -720,50 +694,6 @@ mod tests {
             (0, 0, 0, 0),
             "no glyph when running"
         );
-    }
-
-    /// 应用图标 32px 标定档与托盘待机逐像素一致（同核同语义，边线宽同为 1px）
-    #[test]
-    fn app_icon_matches_tray_idle_at_32px() {
-        let p = Palette::defaults();
-        assert_eq!(
-            app_icon_rgba(32, &p),
-            render_buf(
-                32,
-                &plan(Snapshot::idle(), &p),
-                p.idle_outline(),
-                p.focus,
-                255,
-                false,
-                1
-            )
-        );
-    }
-
-    /// 大尺寸应用图标：边线按比例取整加粗（256px → 8px）且四格保持空心
-    #[test]
-    fn app_icon_bold_outline_stays_hollow() {
-        assert_eq!(brand_line_w(16), 1);
-        assert_eq!(brand_line_w(32), 1);
-        assert_eq!(brand_line_w(48), 2);
-        assert_eq!(brand_line_w(64), 2);
-        assert_eq!(brand_line_w(128), 4);
-        let size = 256;
-        let (sq, gap, off) = geometry(size).unwrap();
-        let p = Palette::defaults();
-        let buf = app_icon_rgba(size, &p);
-        assert_eq!(brand_line_w(size), 8);
-        // 顶边框带内采样 = 轮廓色（恒 1px 时代该点位于透明内区）
-        assert_eq!(px(&buf, size, off + sq / 2, off + 4).0, p.idle_outline().r);
-        // 四格内区中心全部透明——空心「待填充」语义在任何尺寸下不变
-        for (cx, cy) in [
-            (off + sq / 2, off + sq / 2),
-            (off + sq + gap + sq / 2, off + sq / 2),
-            (off + sq / 2, off + sq + gap + sq / 2),
-            (off + sq + gap + sq / 2, off + sq + gap + sq / 2),
-        ] {
-            assert_eq!(px(&buf, size, cx, cy), (0, 0, 0, 0), "hollow at {cx},{cy}");
-        }
     }
 
     // —— 动画数学 ——

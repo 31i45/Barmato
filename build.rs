@@ -1,6 +1,7 @@
-//! 构建脚本：将 Winmato.ico 嵌入可执行文件（Windows 资源）。
+//! 构建脚本：将用户设计的 Winmato.ico 品牌资产嵌入可执行文件（Windows 资源）。
 //!
-//! 仅在 Windows 目标上执行；非 Windows 平台跳过（资源嵌入无意义）。
+//! 该 ico 为手工维护的静态资产（多尺寸整帧），不得用脚本覆盖；
+//! 仅在 Windows 目标上执行，非 Windows 平台跳过（资源嵌入无意义）。
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut res = winres::WindowsResource::new();
