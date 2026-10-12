@@ -10,7 +10,8 @@
 //!
 //! 进度语义（文档 §4.2）：快照对外提供**当前阶段**进度（phase_progress）；
 //! 全周期位置由「第几个专注番茄」（pomodoro_index，4 枚刻点的空间编码）表达；
-//! 阶段边界事件通过单调递增的 stage_seq 暴露给渲染层（边界脉冲触发源，§4.3）。
+//! 阶段边界事件通过单调递增的 stage_seq 暴露给渲染层（边界脉冲触发源，§4.3）；
+//! 完整周期完成以 completed 标记暴露（渲染层据此在待机 tooltip 提示「本轮已完成」）。
 
 use std::time::Duration;
 
@@ -48,6 +49,9 @@ pub struct Snapshot {
     /// 阶段序号：每次阶段推进（含待机→首个专注）单调递增，
     /// 渲染层据此探测阶段边界并触发边界脉冲（文档 §4.3）
     pub stage_seq: u64,
+    /// 本轮大周期是否已完整走完（待机态才有意义；运行态恒 false）。
+    /// 渲染层据此在待机 tooltip 提示「本轮已完成」；待机视觉恒为四格待填充
+    pub completed: bool,
 }
 
 impl Snapshot {
@@ -60,6 +64,7 @@ impl Snapshot {
             phase_progress: 0.0,
             pomodoro_index: 0,
             stage_seq: 0,
+            completed: false,
         }
     }
 }
@@ -72,6 +77,8 @@ pub struct CycleMachine {
     paused: bool,
     /// 单调递增阶段序号（含启动），快照携带以供边界事件检测
     stage_seq: u64,
+    /// 本轮是否已完整收获 4 枚番茄（自然走完长休，或长休暂停后收束）
+    completed: bool,
 }
 
 impl CycleMachine {
@@ -90,16 +97,30 @@ impl CycleMachine {
             elapsed: Duration::ZERO,
             paused: false,
             stage_seq: 0,
+            completed: false,
         }
     }
 
-    /// 唯一交互入口（文档 §3.1）：待机→启动；运行→暂停；暂停→继续
+    /// 唯一交互入口（文档 §3.1）。点击语义由当前状态唯一决定：
+    /// 待机→启动新周期；运行→暂停；暂停→继续；
+    /// **长休暂停→收束本轮**——长休是收尾阶段，4 枚番茄已全部获得，
+    /// 恢复一段收尾冷却毫无收益，用户再点击即表达「休息结束」，
+    /// 回到四格待填充待机态。周期结束后绝不自动开新周期：
+    /// 启动永远由下一次显式点击触发（文档 §3.1 设计决策）。
     pub fn toggle(&mut self) {
         if self.idle() {
             self.stage = 0;
             self.elapsed = Duration::ZERO;
             self.paused = false;
+            self.completed = false; // 新周期开始，清除上一轮完成标记
             self.stage_seq += 1; // 待机→首个专注同样是一次阶段边界
+        } else if self.paused && self.stage == STAGE_LAYOUT.len() - 1 {
+            // 长休暂停后的点击：收束本轮（4 枚番茄均已获得，completed 置位）
+            self.stage = STAGE_LAYOUT.len();
+            self.elapsed = Duration::ZERO;
+            self.paused = false;
+            self.completed = true;
+            self.stage_seq += 1; // 收束也是阶段边界（触发一次脉冲闪光）
         } else {
             self.paused = !self.paused;
         }
@@ -122,9 +143,10 @@ impl CycleMachine {
             self.stage_seq += 1;
         }
         if self.idle() {
-            // 周期收尾：自动回归待机（文档 §2.1-9）
+            // 周期收尾：自动回归待机（文档 §2.1-9），完整走完置完成标记
             self.elapsed = Duration::ZERO;
             self.paused = false;
+            self.completed = true;
         }
     }
 
@@ -137,6 +159,7 @@ impl CycleMachine {
             // 待机仍携带真实 stage_seq，保证跨周期单调不回绕
             return Snapshot {
                 stage_seq: self.stage_seq,
+                completed: self.completed,
                 ..Snapshot::idle()
             };
         }
@@ -159,6 +182,7 @@ impl CycleMachine {
             phase_progress,
             pomodoro_index,
             stage_seq: self.stage_seq,
+            completed: false, // 运行态恒 false（toggle 启动时已清零）
         }
     }
 }
@@ -272,6 +296,55 @@ mod tests {
         assert_eq!(s.phase_progress, 0.0);
         assert_eq!(s.pomodoro_index, 1);
         assert_eq!(s.stage_seq, seq_before + 1); // 重启也是新边界，序号单调不回绕
+    }
+
+    /// 完整走完大周期 → 待机携带完成标记；重启新周期 → 标记清除
+    #[test]
+    fn completed_flag_lifecycle() {
+        let mut m = machine();
+        assert!(!m.snapshot().completed); // 初始未完成
+        m.toggle();
+        assert!(!m.snapshot().completed); // 运行态恒 false
+                                          // 完整走完 8 阶段
+        m.tick(F + S + F + S + F + S + F + L + Duration::from_secs(1));
+        let s = m.snapshot();
+        assert!(s.idle);
+        assert!(s.completed); // 自然到期 → 徽章
+        m.toggle();
+        assert!(!m.snapshot().completed); // 新周期 → 清除
+    }
+
+    /// 长休暂停后的再点击 → 收束本轮（待机 + completed）；下次点击才开新周期
+    #[test]
+    fn toggle_during_paused_long_break_finishes_cycle() {
+        let mut m = machine();
+        m.toggle();
+        m.tick(F + S + F + S + F + S + F); // 4 专注 + 3 短休走完，进入长休
+        assert_eq!(m.snapshot().phase, Phase::LongBreak);
+        m.toggle(); // 暂停（图标降亮 + ❚❚）
+        assert!(m.snapshot().paused);
+        m.toggle(); // 再点击：休息结束 → 收束本轮
+        let s = m.snapshot();
+        assert!(s.idle && !s.paused);
+        assert!(s.completed); // 4 枚番茄均已获得
+        assert_eq!(s.stage_seq, 9); // 启动 + 7 次阶段边界 + 收束
+        let seq = s.stage_seq;
+        m.toggle(); // 下一次点击：全新周期
+        let s2 = m.snapshot();
+        assert!(!s2.idle);
+        assert!(!s2.completed);
+        assert_eq!(s2.phase, Phase::Focus);
+        assert_eq!(s2.stage_seq, seq + 1);
+    }
+
+    /// 中途退出（假想：进程退出即放弃）不产生徽章——
+    /// 只有自然到期才置位，toggle 启动会清零，这里验证运行中不置位
+    #[test]
+    fn completed_not_set_midway() {
+        let mut m = machine();
+        m.toggle();
+        m.tick(F + S); // 仅走完前两阶段
+        assert!(!m.snapshot().completed);
     }
 
     /// 当前阶段进度在阶段内部单调递增，且中点约为 0.5

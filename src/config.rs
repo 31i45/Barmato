@@ -1,9 +1,9 @@
 //! 配置加载模块（文档 §6.5 / §2.2）
 //!
-//! 只读加载 %APPDATA%\Barmato\config.json。
+//! 只读加载 %APPDATA%\Winmato\config.json。
 //! 缺失、损坏、字段非法时一律静默回退出厂默认参数——不报错、不弹窗、不写回。
 //!
-//! 配置单位为**秒**（出厂默认 25min/5min/20min 即 1500s/300s/1200s）。
+//! 配置单位为**秒**（当前测试用短时长 25s/5s/20s；正式版为 25min/5min/20min）。
 //! 秒级配置可让开发者/发烧友用 25s 等短时长快速验证完整番茄大周期；
 //! 合法范围 1..=36000 秒（1 秒 ~ 10 小时），越界回退默认。
 
@@ -12,13 +12,16 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::colors::{Palette, Rgb, COLOR_KEY};
+use crate::colors::{Palette, Rgb};
 
 /// 出厂默认时长（秒）——全局唯一事实来源。
 /// 程序默认与配置解析回退共用此常量，杜绝两处字面量漂移（避免重复实现）。
-pub const DEFAULT_FOCUS_SECS: u64 = 25 * 60;
-pub const DEFAULT_SHORT_BREAK_SECS: u64 = 5 * 60;
-pub const DEFAULT_LONG_BREAK_SECS: u64 = 20 * 60;
+///
+/// 注意：当前为**测试用短时长**（25s/5s/20s），用于快速验证完整大周期。
+/// 发布正式版前须改回真实番茄钟时长（1500/300/1200 秒）。
+pub const DEFAULT_FOCUS_SECS: u64 = 25;
+pub const DEFAULT_SHORT_BREAK_SECS: u64 = 5;
+pub const DEFAULT_LONG_BREAK_SECS: u64 = 20;
 
 /// 时长合法区间（秒）：1 ~ 10 小时
 const MIN_SECS: u64 = 1;
@@ -29,7 +32,6 @@ pub struct AppConfig {
     pub short_break: Duration,
     pub long_break: Duration,
     pub palette: Palette,
-    pub render_all_monitors: bool,
 }
 
 impl Default for AppConfig {
@@ -39,7 +41,6 @@ impl Default for AppConfig {
             short_break: Duration::from_secs(DEFAULT_SHORT_BREAK_SECS),
             long_break: Duration::from_secs(DEFAULT_LONG_BREAK_SECS),
             palette: Palette::defaults(),
-            render_all_monitors: false,
         }
     }
 }
@@ -49,7 +50,6 @@ struct RawFile {
     /// 各阶段时长（秒）
     durations: Option<RawDurations>,
     colors: Option<RawColors>,
-    render_all_monitors: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -75,7 +75,7 @@ fn config_path() -> PathBuf {
     let mut p = std::env::var("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    p.push("Barmato");
+    p.push("Winmato");
     p.push("config.json");
     p
 }
@@ -105,9 +105,6 @@ pub fn parse(text: &str) -> AppConfig {
             cfg.palette.long_break = v;
         }
     }
-    if let Some(m) = raw.render_all_monitors {
-        cfg.render_all_monitors = m;
-    }
     cfg
 }
 
@@ -119,10 +116,9 @@ fn seconds(v: Option<u64>, default: u64) -> Duration {
     }
 }
 
-/// 解析阶段配色；拒绝与透明键相同的值（否则该阶段进度填充不可见）
+/// 解析阶段配色；非法输入返回 None（由调用方静默回退默认）
 fn parse_color(v: &Option<String>) -> Option<Rgb> {
-    let rgb = v.as_deref().and_then(Rgb::from_hex)?;
-    (rgb != COLOR_KEY).then_some(rgb)
+    v.as_deref().and_then(Rgb::from_hex)
 }
 
 #[cfg(test)]
@@ -135,7 +131,6 @@ mod tests {
         assert_eq!(c.focus, Duration::from_secs(DEFAULT_FOCUS_SECS));
         assert_eq!(c.short_break, Duration::from_secs(DEFAULT_SHORT_BREAK_SECS));
         assert_eq!(c.long_break, Duration::from_secs(DEFAULT_LONG_BREAK_SECS));
-        assert!(!c.render_all_monitors);
     }
 
     #[test]
@@ -173,12 +168,6 @@ mod tests {
     #[test]
     fn invalid_color_falls_back() {
         let c = parse(r#"{"colors":{"focus":"not-a-color"}}"#);
-        assert_eq!(c.palette.focus, Palette::defaults().focus);
-    }
-
-    #[test]
-    fn color_key_rejected() {
-        let c = parse(r##"{"colors":{"focus":"#FF00FF"}}"##);
         assert_eq!(c.palette.focus, Palette::defaults().focus);
     }
 }

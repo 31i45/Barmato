@@ -1,31 +1,26 @@
-//! Barmato 薄主线（文档 §6：深模块、浅接口）
+//! Winmato 薄主线（文档 §6：深模块、浅接口）
 //!
 //! 本文件只做粘合：单实例守卫 → 加载配置 → 隐藏宿主窗口 + 消息循环
 //! → 托盘图标（左键启停 / 右键退出）→ 定时驱动周期状态机 → 按快照渲染。
 //! 全部系统复杂度封装在各深模块内部。
 //!
-//! 职责分离不变量（文档 §3.1/§4.1/§4.2）：
-//! **首选渲染 = 任务栏整体染色（色相 = 阶段，慢变量）；嵌入细条 = 阶段进度 + 4 刻点（快变量）；
-//! 染色不可用则静默降级为纯细条，再降级为透明。交互入口为托盘图标左键，
-//! 托盘图标同步镜像当前状态（阶段色相/暂停空心/待机暗灰）**。
+//! T 方案（文档 §4.1）：托盘图标本身即唯一可视化表面——画布尺寸自适应
+//! 任务栏厚度（启动时只读一次，失败回退 SM_CXSMICON），其上渲染 2×2 格阵
+//! （四格 ≡ 4 个专注番茄，格位 = 番茄序，灌注高度 = 当前阶段进度，色相 = 阶段；
+//! 边框永存；暂停叠加居中暂停符号 ❚❚），由 icon.rs 的纯函数渲染器生成。
+//! 交互入口与可视化合二为一。
 
 #![windows_subsystem = "windows"]
 
-mod colors;
-mod config;
-mod cycle;
-mod overlay;
-mod taskbar;
-mod tint;
-
 use std::time::Instant;
 
-use cycle::{CycleMachine, Snapshot};
-use overlay::Overlay;
-use taskbar::Taskbar;
+use winmato::colors::Palette;
+use winmato::config;
+use winmato::cycle::{CycleMachine, Snapshot};
+use winmato::icon::IconRenderer;
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use windows::core::w;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
@@ -42,74 +37,39 @@ const TIMER_ID: usize = 1;
 const TICK_MS: u32 = 250;
 /// 阶段过渡期心跳：提高帧率使色彩插值平滑（文档 §4.3）
 const TICK_FAST_MS: u32 = 50;
-/// 运行时每 1 秒静默校验一次任务栏几何（位置/尺寸/DPI/资源管理器变动，文档 §6.2 / §7）
-const GEOMETRY_TICKS: u64 = 4;
-/// 待机无渲染需求，几何探测降频至约 10 秒一次，极致轻量（文档 §4.3）
-const GEOMETRY_TICKS_IDLE: u64 = 40;
-
-/// 一条任务栏与其渲染器一一对应（默认仅主屏，文档 §4.1）
-struct Bar {
-    taskbar: Taskbar,
-    overlay: Option<Overlay>,
-    /// 染色可用性（文档 §4.1 降级阶梯）：None=未探测，Some(true)=染色生效，
-    /// Some(false)=平台不支持已永久降级为纯细条（仅几何重建才重探测）
-    tint_ok: Option<bool>,
-    /// 当前已染上的颜色（None=原生外观）：染色是慢变量，仅阶段/主题/几何
-    /// 变化才变色，同色重设徒增 DWM 重合成抖动（§4.3 无闪烁）——按色去重
-    tint_applied: Option<colors::Rgb>,
-}
+/// 托盘提示文案：常规待机/运行态 与 本轮完整完成后的待机态（§4.2 完成标记）
+const TOOLTIP_NORMAL: &str = "左键启停 / 右键退出";
+const TOOLTIP_COMPLETED: &str = "本轮已完成 · 左键启停 / 右键退出";
 
 struct App {
     machine: CycleMachine,
-    config: config::AppConfig,
-    bars: Vec<Bar>,
+    palette: Palette,
+    renderer: IconRenderer,
     tray: tray_icon::TrayIcon,
-    /// 已落到托盘的图标状态（色相, 是否空心；待机=中性暗灰），仅在变化时重建
-    last_icon: Option<(colors::Rgb, bool)>,
     last_snap: Snapshot,
     last_tick: Instant,
-    tick_count: u64,
-    geometry_dirty: bool,
-    /// 系统任务栏主题（浅色=黑字）：决定染色亮度策略（文档 §4.1 染色自适应）
-    taskbar_light: bool,
-    taskbar_created_msg: u32,
     /// 当前定时器间隔；仅在变化时才调用 SetTimer，避免重复重置丢帧
     timer_interval: u32,
+    /// 已落盘的 tooltip（完成态变化时才更新，避免重复 FFI）
+    last_tooltip: Option<&'static str>,
 }
 
 impl App {
-    fn new(cfg: config::AppConfig, taskbar_created_msg: u32, tray: tray_icon::TrayIcon) -> App {
+    fn new(cfg: config::AppConfig, tray: tray_icon::TrayIcon, renderer: IconRenderer) -> App {
         let machine = CycleMachine::new(cfg.focus, cfg.short_break, cfg.long_break);
-        let bars: Vec<Bar> = Taskbar::refresh_all(cfg.render_all_monitors)
-            .into_iter()
-            .map(|taskbar| Bar {
-                taskbar,
-                overlay: None,
-                tint_ok: None,
-                tint_applied: None,
-            })
-            .collect();
-        // 启动自愈：清理上次进程异常退出可能残留的染色（文档 §7 静默修复）
-        for b in &bars {
-            tint::apply(b.taskbar.hwnd, None);
-        }
         App {
             machine,
-            config: cfg,
-            bars,
+            palette: cfg.palette,
+            renderer,
             tray,
-            last_icon: None,
             last_snap: Snapshot::idle(),
             last_tick: Instant::now(),
-            tick_count: 0,
-            geometry_dirty: false,
-            taskbar_light: tint::system_taskbar_is_light(),
-            taskbar_created_msg,
             timer_interval: TICK_MS,
+            last_tooltip: None,
         }
     }
 
-    /// 定时心跳：推进计时 → 校验几何 → 渲染 → 按过渡状态调整帧率
+    /// 定时心跳：推进计时 → 渲染 → 按动画状态调整帧率
     fn on_timer(&mut self, hwnd: HWND) {
         let now = Instant::now();
         let delta = now.duration_since(self.last_tick);
@@ -117,24 +77,7 @@ impl App {
         self.machine.tick(delta);
 
         let snap = self.machine.snapshot();
-        // 待机极致轻量（文档 §4.3）：无渲染需求时几何探测降频至约 10 秒一次
-        self.tick_count += 1;
-        let geo_period = if snap.idle {
-            GEOMETRY_TICKS_IDLE
-        } else {
-            GEOMETRY_TICKS
-        };
-        if self.geometry_dirty || self.tick_count.is_multiple_of(geo_period) {
-            self.refresh_geometry();
-        }
-
-        // 仅在快照变化或有进行中动画（过渡/脉冲/呼吸）时重绘：
-        // 暂停且呼吸平静期以外不制造无谓重绘
-        let animating = self.bars.iter().any(|b| {
-            b.overlay
-                .as_ref()
-                .is_some_and(Overlay::needs_continuous_render)
-        });
+        let animating = self.renderer.needs_continuous_render();
         if snap != self.last_snap || animating {
             self.apply(snap, now);
         }
@@ -142,10 +85,7 @@ impl App {
 
         // 过渡/脉冲等短动画提高帧率保证平滑（文档 §4.3）；12s 慢呼吸用常规帧率即可。
         // 仅在间隔实际变化时才调用 SetTimer，避免重复重置导致丢帧
-        let fast = self
-            .bars
-            .iter()
-            .any(|b| b.overlay.as_ref().is_some_and(Overlay::needs_fast_frames));
+        let fast = self.renderer.needs_fast_frames();
         let interval = if fast { TICK_FAST_MS } else { TICK_MS };
         if interval != self.timer_interval {
             self.timer_interval = interval;
@@ -156,7 +96,6 @@ impl App {
     }
 
     /// 唯一用户交互（文档 §3.1）：托盘图标左键点击触发状态切换。
-    /// 右键点击弹出菜单（仅退出），由 tray-icon crate 自行处理，不进入此方法。
     fn on_toggle(&mut self) {
         let now = Instant::now();
         self.machine.toggle();
@@ -165,140 +104,132 @@ impl App {
         self.last_snap = snap;
     }
 
-    /// 重新探测任务栏几何（文档 §6.2 / §7）。
-    /// 仅当任务栏句柄/矩形变化时才重建对应覆盖层。
-    fn refresh_geometry(&mut self) {
-        let new_tbs = Taskbar::refresh_all(self.config.render_all_monitors);
-        let mut new_bars: Vec<Bar> = Vec::with_capacity(new_tbs.len());
-        for tb in new_tbs {
-            // 单次遍历：按句柄+矩形匹配旧 Bar，取出覆盖层与染色状态
-            // 句柄变化（任务栏重建）时染色探测也随之重置，下帧重新尝试染色
-            let (overlay, tint_ok, tint_applied) = self
-                .bars
-                .iter_mut()
-                .find(|b| b.taskbar.hwnd == tb.hwnd && rect_eq(&b.taskbar.rect, &tb.rect))
-                .map_or((None, None, None), |b| {
-                    (b.overlay.take(), b.tint_ok, b.tint_applied)
-                });
-            new_bars.push(Bar {
-                taskbar: tb,
-                overlay,
-                tint_ok,
-                tint_applied,
-            });
-        }
-        self.bars = new_bars;
-        self.geometry_dirty = false;
-    }
-
-    /// 把状态快照落到任务栏视觉与托盘图标上（文档 §4.2 / §4.3）
+    /// 把状态快照落到托盘图标上（文档 §4.2 / §4.3）
     fn apply(&mut self, snap: Snapshot, now: Instant) {
-        self.update_tray_icon(snap);
-        if snap.idle {
-            self.restore_idle();
-            return;
-        }
-        let target = self.config.palette.for_phase(snap.phase);
-        let tint_color = colors::ensure_contrast(target, self.taskbar_light);
-        for b in self.bars.iter_mut() {
-            Self::apply_tint(b, tint_color);
-            Self::render_strip(b, snap, target, tint_color, now);
-        }
-    }
-
-    /// 托盘镜像（文档 §4.2）：运行=阶段色相实心圆点，暂停=空心圆环，待机=中性暗灰。
-    /// 仅在状态变化时重建图标，避免每帧分配。
-    fn update_tray_icon(&mut self, snap: Snapshot) {
-        let icon_state = if snap.idle {
-            (colors::IDLE_DOT, false)
+        let icon = self.renderer.render(snap, &self.palette, now);
+        let _ = self.tray.set_icon(Some(icon));
+        // 完成标记的文字补充：tooltip 仅在完成态翻转时更新（零视觉成本的信息通道）
+        let tooltip = if snap.idle && snap.completed {
+            TOOLTIP_COMPLETED
         } else {
-            (self.config.palette.for_phase(snap.phase), snap.paused)
+            TOOLTIP_NORMAL
         };
-        if self.last_icon != Some(icon_state) {
-            let _ = self
-                .tray
-                .set_icon(Some(make_icon(icon_state.0, icon_state.1)));
-            self.last_icon = Some(icon_state);
+        if self.last_tooltip != Some(tooltip) {
+            let _ = self.tray.set_tooltip(Some(tooltip));
+            self.last_tooltip = Some(tooltip);
         }
     }
 
-    /// 待机：完全停止绘制并恢复任务栏原生外观（文档 §4.1/§4.3）
-    fn restore_idle(&mut self) {
-        for b in self.bars.iter_mut() {
-            if b.tint_applied.is_some() {
-                tint::apply(b.taskbar.hwnd, None);
-                b.tint_applied = None;
-            }
-            b.tint_ok = None;
-            if let Some(o) = b.overlay.as_mut() {
-                o.hide();
-            }
-        }
-    }
-
-    /// 首选策略 D：任务栏整体染色。仅在目标色变化时调用 FFI（阶段切换/
-    /// 主题切换/几何重建才会变色）。探测失败 → 永久降级为纯细条（C），
-    /// 不逐帧重试；仅几何重建才重置探测（文档 §4.1 降级阶梯）
-    fn apply_tint(b: &mut Bar, tint_color: colors::Rgb) {
-        if b.tint_ok != Some(false) && b.tint_applied != Some(tint_color) {
-            if tint::apply(b.taskbar.hwnd, Some(tint_color)) {
-                b.tint_ok = Some(true);
-                b.tint_applied = Some(tint_color);
-            } else {
-                tint::apply(b.taskbar.hwnd, None);
-                b.tint_ok = Some(false);
-                b.tint_applied = None;
-            }
-        }
-    }
-
-    /// 细条（快变量通道）：进度填充 + 刻点 + 边界脉冲 + 暂停呼吸。
-    /// 染色生效时底色 = tint_color（§4.2 细条同色底色），
-    /// 降级时 = target 原色（最大可见度）。
-    /// 覆盖层缺失或父窗口已销毁 → 静默重建（文档 §7）
-    fn render_strip(
-        b: &mut Bar,
-        snap: Snapshot,
-        target: colors::Rgb,
-        tint_color: colors::Rgb,
-        now: Instant,
-    ) {
-        let strip_color = if b.tint_applied.is_some() {
-            tint_color
-        } else {
-            target
-        };
-        let need_new = match b.overlay.as_ref() {
-            None => true,
-            Some(o) => !o.is_alive(),
-        };
-        if need_new {
-            b.overlay = Overlay::new(b.taskbar.hwnd);
-        }
-        let Some(o) = b.overlay.as_mut() else {
-            return; // 创建失败：静默降级，无渲染但不报错
-        };
-        // 渲染失败被降级隐藏后，这里自动重新显示恢复（文档 §7 静默恢复）
-        if !o.is_visible() {
-            o.show();
-        }
-        o.render(snap, strip_color, now);
-    }
-
-    /// 退出前恢复任务栏原生外观（文档 §3.2：退出即放弃周期；§7 不留残迹）
-    fn restore_all_tints(&mut self) {
-        for b in &mut self.bars {
-            if b.tint_applied.is_some() {
-                tint::apply(b.taskbar.hwnd, None);
-                b.tint_applied = None;
-            }
-            b.tint_ok = None;
-        }
+    /// 退出前复位到待机图标（文档 §3.2：退出即放弃周期；§7 不留残迹）
+    fn shutdown(&mut self) {
+        self.renderer.reset();
+        let icon = self
+            .renderer
+            .render(Snapshot::idle(), &self.palette, Instant::now());
+        let _ = self.tray.set_icon(Some(icon));
     }
 }
 
-fn rect_eq(a: &windows::Win32::Foundation::RECT, b: &windows::Win32::Foundation::RECT) -> bool {
-    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+/// 将托盘图标从隐藏溢出区提升到任务栏可见区（Windows 11）。
+///
+/// Windows 11 默认将新通知图标放入隐藏溢出区（chevron 折叠区）。
+/// 提升需修改注册表 `HKCU\Control Panel\NotifyIconSettings\<id>`
+/// 的 `IsPromoted` 值为 1。该值在 `Shell_NotifyIconW(NIM_ADD)` 后由
+/// 系统同步创建，故在托盘图标创建后立即调用即可可靠找到。
+///
+/// 失败时静默降级——图标仍可用，只是留在溢出区（文档 §7 优雅降级）。
+fn promote_tray_icon() {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+    };
+
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => match p.to_str() {
+            Some(s) => s.to_lowercase(),
+            None => return,
+        },
+        Err(_) => return,
+    };
+
+    unsafe {
+        let mut root = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Control Panel\\NotifyIconSettings"),
+            0,
+            KEY_READ | KEY_WRITE,
+            &mut root,
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let mut index = 0u32;
+        loop {
+            let mut name = [0u16; 256];
+            let mut name_len = name.len() as u32;
+            let result = RegEnumKeyExW(
+                root,
+                index,
+                windows::core::PWSTR(name.as_mut_ptr()),
+                &mut name_len,
+                None,
+                windows::core::PWSTR::null(),
+                None,
+                None,
+            );
+            if result.is_err() {
+                break;
+            }
+            index += 1;
+
+            let mut sub = HKEY::default();
+            if RegOpenKeyExW(
+                root,
+                PCWSTR(name.as_ptr()),
+                0,
+                KEY_READ | KEY_WRITE,
+                &mut sub,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            let mut buf = [0u16; 512];
+            let mut buf_len = buf.len() as u32;
+            let mut reg_type = REG_VALUE_TYPE::default();
+            let qres = RegQueryValueExW(
+                sub,
+                w!("ExecutablePath"),
+                None,
+                Some(&mut reg_type),
+                Some(buf.as_mut_ptr() as *mut u8),
+                Some(&mut buf_len),
+            );
+
+            if qres.is_ok() && (reg_type == REG_SZ || reg_type == REG_EXPAND_SZ) {
+                let len = (buf_len / 2) as usize;
+                let stored = String::from_utf16_lossy(&buf[..len])
+                    .trim_end_matches('\0')
+                    .to_lowercase();
+                if stored == exe_path {
+                    let _ = RegSetValueExW(
+                        sub,
+                        w!("IsPromoted"),
+                        0,
+                        REG_DWORD,
+                        Some(&1u32.to_ne_bytes()),
+                    );
+                }
+            }
+            let _ = RegCloseKey(sub);
+        }
+        let _ = RegCloseKey(root);
+    }
 }
 
 fn main() {
@@ -309,7 +240,7 @@ fn main() {
     // 单实例守卫（文档 §3.2：重启即回归待机）
     // GetLastError 必须在 CreateMutexW 后立即检查——
     // 中间任何 Win32/IO 调用都会覆盖线程的 LastError 值
-    let Ok(_mutex) = (unsafe { CreateMutexW(None, false, w!("Barmato.SingleInstance")) }) else {
+    let Ok(_mutex) = (unsafe { CreateMutexW(None, false, w!("Winmato.SingleInstance")) }) else {
         return;
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -322,7 +253,7 @@ fn main() {
     let instance = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
 
     // 隐藏宿主窗口：仅作为消息循环载体，用户永不可见
-    let class = w!("BarmatoHost");
+    let class = w!("WinmatoHost");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance.into(),
@@ -351,28 +282,30 @@ fn main() {
         return;
     };
 
-    // 资源管理器重启广播（文档 §7）
-    let taskbar_created_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-
     // 托盘：左键 = 启停切换，右键 = 菜单（仅退出）（文档 §3.1/§3.2）
-    // 图标同时承担状态镜像（文档 §4.2）：初始待机 = 中性暗灰圆点
+    // 初始图标 = 待机态（四格空心灰色轮廓）
+    let mut renderer = IconRenderer::new();
+    let initial_icon = renderer.render(Snapshot::idle(), &cfg.palette, Instant::now());
+
     let menu = Menu::new();
-    let exit_item = MenuItem::with_id(MenuId::new("barmato.exit"), "退出", true, None);
+    let exit_item = MenuItem::with_id(MenuId::new("winmato.exit"), "退出", true, None);
     let exit_id = exit_item.id();
     let _ = menu.append(&exit_item);
     let Ok(tray) = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_icon(make_icon(colors::IDLE_DOT, false))
-        .with_tooltip("Barmato - 左键启停 / 右键退出")
-        .with_title("Barmato")
-        .with_menu_on_left_click(false) // 左键不弹菜单，专用于 toggle
+        .with_icon(initial_icon)
+        .with_tooltip(TOOLTIP_NORMAL)
+        .with_title("Winmato")
+        .with_menu_on_left_click(false)
         .build()
     else {
         return;
     };
 
-    let mut app = App::new(cfg, taskbar_created_msg, tray);
-    // 上下文挂载到窗口自身（Win32 正统做法），无全局可变状态
+    // 将托盘图标提升到任务栏可见区
+    promote_tray_icon();
+
+    let mut app = App::new(cfg, tray, renderer);
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut app as *mut App as isize);
     }
@@ -384,19 +317,14 @@ fn main() {
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // 菜单事件：退出
             if let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id() == exit_id {
-                    // 退出即不留残迹（文档 §3.2/§7）：先恢复任务栏原生外观
                     let app = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
-                    app.restore_all_tints();
+                    app.shutdown();
                     PostQuitMessage(0);
-                    // 跳过本帧 DispatchMessageW——若 msg 是 WM_TIMER，
-                    // on_timer→apply 会重新染色，覆盖刚恢复的原生外观
                     continue;
                 }
             }
-            // 托盘图标事件：左键 Down → toggle
             if let Ok(TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Down,
@@ -430,62 +358,11 @@ unsafe extern "system" fn wnd_proc(
             app.on_timer(hwnd);
             LRESULT(0)
         }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            // 几何可能变化（显示模式/DPI/任务栏重排）；系统主题切换亦经
-            // WM_SETTINGCHANGE 广播 → 重读任务栏主题，并把上次快照归零，
-            // 强制下帧以新主题重应用染色（待机本无染色，快照相等自然跳过）
-            app.geometry_dirty = true;
-            app.taskbar_light = tint::system_taskbar_is_light();
-            // 系统事件可能已重置任务栏 accent policy，同色去重缓存必须清除，
-            // 否则 apply_tint 认为已染色而跳过 FFI 调用
-            for b in &mut app.bars {
-                b.tint_applied = None;
-                b.tint_ok = None;
-            }
-            app.last_snap = Snapshot::idle();
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        m if m != 0 && m == app.taskbar_created_msg => {
-            // 资源管理器重启：强制重建任务栏几何与覆盖层
-            app.geometry_dirty = true;
-            app.refresh_geometry();
-            // 新 HWND 的 tint_applied 已在 refresh_geometry 中归 None，
-            // 但 last_snap 可能与下帧相同导致 apply 不被调用 → 强制归零
-            app.last_snap = Snapshot::idle();
-            LRESULT(0)
-        }
         WM_DESTROY => {
-            // 宿主窗口被销毁（含系统关机路径）同样恢复任务栏原生外观
-            app.restore_all_tints();
+            app.shutdown();
             PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-/// 程序生成 32×32 托盘图标（文档 §4.2 托盘镜像），无外部资源依赖：
-/// - 实心 = 运行（色相随阶段）；空心圆环 = 暂停；中性暗灰 = 待机
-/// - 图标色相对输入色提亮 20%，保证在深色/浅色托盘背景上均可辨
-fn make_icon(color: colors::Rgb, hollow: bool) -> Icon {
-    let size = 32u32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let c = color.lighten(0.2);
-    let (center, r_out) = (15.5_f64, 13.0_f64);
-    // 空心圆环的内半径；实心时内半径为 0
-    let r_in = if hollow { r_out - 4.0 } else { 0.0 };
-    for y in 0..size {
-        for x in 0..size {
-            let (dx, dy) = (x as f64 - center, y as f64 - center);
-            let d2 = dx * dx + dy * dy;
-            if d2 <= r_out * r_out && d2 >= r_in * r_in {
-                let i = ((y * size + x) * 4) as usize;
-                rgba[i] = c.r;
-                rgba[i + 1] = c.g;
-                rgba[i + 2] = c.b;
-                rgba[i + 3] = 255;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, size, size).expect("tray icon")
 }

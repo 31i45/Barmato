@@ -21,11 +21,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test（发布前强制全绿）
-        run: cargo test
+      - name: Format check
+        run: cargo fmt --check
 
       - name: Clippy（零警告门槛）
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
 
       - name: Build release
         run: cargo build --release
@@ -33,12 +36,13 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          Copy-Item target/release/barmato.exe "barmato-$tag-x86_64-windows.exe"
-          Compress-Archive -Path target/release/barmato.exe -DestinationPath "barmato-$tag-x86_64-windows.zip"
+          Copy-Item target/release/winmato.exe Winmato.exe
+          Compress-Archive -Path Winmato.exe -DestinationPath Winmato.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: barmato-${{ github.ref_name }}-x86_64-windows.*
+          files: |
+            Winmato.exe
+            Winmato.zip
           generate_release_notes: true

@@ -1,10 +1,10 @@
 [package]
-name = "barmato"
-version = "1.3.0"
+name = "winmato"
+version = "2.1.0"
 edition = "2021"
-description = "Bar + Tomato — 极简环境式番茄钟：任务栏整体染色 + 内缘细条环境反馈，无弹窗、无数字、无声音"
+description = "Win + Tomato — 极简环境式番茄钟：托盘图标四格可视化（四格 ≡ 4 个番茄），无弹窗、无数字、无声音"
 license = "MIT"
-repository = "https://github.com/31i45/Barmato"
+repository = "https://github.com/31i45/Winmato"
 
 [dependencies]
 windows = { version = "0.58", features = [
@@ -17,11 +17,12 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
-softbuffer = "0.4"
 tray-icon = "0.19"
-raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[build-dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 2
