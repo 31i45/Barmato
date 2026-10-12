@@ -176,34 +176,34 @@ struct CellPos {
     sq: i32,
 }
 
-/// 1px 空心边框（结构层：任何格子恒有，文档 §4.2 边框永存不变量）
-fn draw_outline(buf: &mut [u8], size: i32, c: CellPos, color: Rgb, alpha: u8) {
-    for dx in 0..c.sq {
-        set_pixel(buf, size, c.x + dx, c.y, color, alpha);
-        set_pixel(buf, size, c.x + dx, c.y + c.sq - 1, color, alpha);
-    }
-    for dy in 1..c.sq - 1 {
-        set_pixel(buf, size, c.x, c.y + dy, color, alpha);
-        set_pixel(buf, size, c.x + c.sq - 1, c.y + dy, color, alpha);
+/// w 像素空心边框（结构层：任何格子恒有，文档 §4.2 边框永存不变量）。
+/// w = 1 时与标定实现逐像素一致。
+fn draw_outline(buf: &mut [u8], size: i32, c: CellPos, color: Rgb, alpha: u8, w: i32) {
+    for dy in 0..c.sq {
+        for dx in 0..c.sq {
+            if dx < w || dx >= c.sq - w || dy < w || dy >= c.sq - w {
+                set_pixel(buf, size, c.x + dx, c.y + dy, color, alpha);
+            }
+        }
     }
 }
 
-/// 内区实心填充（内容层：inset 1px，永不覆盖边框）
-fn draw_solid(buf: &mut [u8], size: i32, c: CellPos, color: Rgb, alpha: u8) {
-    for dy in 1..c.sq - 1 {
-        for dx in 1..c.sq - 1 {
+/// 内区实心填充（内容层：inset w，永不覆盖边框）
+fn draw_solid(buf: &mut [u8], size: i32, c: CellPos, color: Rgb, alpha: u8, w: i32) {
+    for dy in w..c.sq - w {
+        for dx in w..c.sq - w {
             set_pixel(buf, size, c.x + dx, c.y + dy, color, alpha);
         }
     }
 }
 
 /// 内区底部灌注，高度 fh（自内区底边向上，文档 §4.2 灌注语义）
-fn draw_fill(buf: &mut [u8], size: i32, c: CellPos, fh: i32, color: Rgb, alpha: u8) {
-    let inner = c.sq - 2;
+fn draw_fill(buf: &mut [u8], size: i32, c: CellPos, fh: i32, color: Rgb, alpha: u8, w: i32) {
+    let inner = c.sq - 2 * w;
     let fh = fh.clamp(0, inner);
-    let top = c.y + 1 + inner - fh;
-    for dy in top..c.y + 1 + inner {
-        for dx in 1..c.sq - 1 {
+    let top = c.y + w + inner - fh;
+    for dy in top..c.y + w + inner {
+        for dx in w..c.sq - w {
             set_pixel(buf, size, c.x + dx, dy, color, alpha);
         }
     }
@@ -220,6 +220,7 @@ fn render_buf(
     fill_color: Rgb,
     alpha: u8,
     paused: bool,
+    line_w: i32,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; (size * size * 4) as usize];
     let Some((sq, gap, off)) = geometry(size) else {
@@ -246,16 +247,16 @@ fn render_buf(
     for (spec, &c) in specs.iter().zip(positions.iter()) {
         // 内容层：底色 + 灌注（均限于内区）
         if let Some(color) = spec.base {
-            draw_solid(&mut buf, size, c, color, alpha);
+            draw_solid(&mut buf, size, c, color, alpha, line_w);
         }
         if let Some((_, frac)) = spec.fill {
-            let inner = c.sq - 2;
+            let inner = c.sq - 2 * line_w;
             // 最低 1px：启动瞬间即有可见反馈（进度 0 ≠ 无窗口）
             let fh = ((inner as f64) * frac.clamp(0.0, 1.0)).round().max(1.0) as i32;
-            draw_fill(&mut buf, size, c, fh, fill_color, alpha);
+            draw_fill(&mut buf, size, c, fh, fill_color, alpha, line_w);
         }
         // 结构层：边框永存（内容之后绘制，视觉上包住内容）
-        draw_outline(&mut buf, size, c, outline, alpha);
+        draw_outline(&mut buf, size, c, outline, alpha, line_w);
     }
     // 暂停符号：格阵之上居中叠加 ❚❚——阶段色、恒满不透明，
     // 不参与降亮/呼吸，是暂停态中的对比锚点（非文字、通用暂停语义）
@@ -292,11 +293,13 @@ fn draw_pause_glyph(buf: &mut [u8], size: i32, color: Rgb, alpha: u8) {
     }
 }
 
-/// 待机「待填充四格」画布的 RGBA 像素（应用图标生成入口）。
+/// 应用图标（exe 资源）画布的 RGBA 像素：四格空心「待填充」。
 ///
-/// 与托盘渲染共用 plan/render_buf 核心：exe 图标与托盘待机态
-/// 语义、几何、配色逐像素一致（examples/gen_icon 使用）。
-pub fn idle_rgba(size: i32, palette: &Palette) -> Vec<u8> {
+/// 与托盘待机同一渲染核心、同一几何与语义；唯一差异是边线宽度随画布
+/// 比例取整加粗（`brand_line_w`）——应用图标会在资源管理器等场景大幅
+/// 放大显示，恒定 1px 在大尺寸下退化为不可见的发丝线。逐尺寸重推几何，
+/// 加粗后边缘依然锐利无模糊（examples/gen_icon 使用）。
+pub fn app_icon_rgba(size: i32, palette: &Palette) -> Vec<u8> {
     let specs = plan(Snapshot::idle(), palette);
     render_buf(
         size,
@@ -305,7 +308,15 @@ pub fn idle_rgba(size: i32, palette: &Palette) -> Vec<u8> {
         palette.focus,
         255,
         false,
+        brand_line_w(size),
     )
+}
+
+/// 应用图标边线宽：以 32px 档标定为 1px，随画布比例取整加粗
+/// （16/24/32 → 1、48/64 → 2、128 → 4、256 → 8），
+/// 任何尺寸下四格空心轮廓都完整显现。
+fn brand_line_w(size: i32) -> i32 {
+    ((size as f64) / 32.0).round().max(1.0) as i32
 }
 
 /// 托盘图标渲染器：封装全部动画状态与画布尺寸，对外只暴露 render()。
@@ -421,6 +432,7 @@ impl IconRenderer {
             fill_color,
             alpha,
             snap.paused,
+            1,
         );
         Icon::from_rgba(buf, self.size as u32, self.size as u32).expect("icon render")
     }
@@ -568,7 +580,7 @@ mod tests {
         let (sq, _gap, off) = geometry(size).unwrap();
         let p = Palette::defaults();
         let specs = plan(snap(false, Phase::Focus, 1.0, 1), &p);
-        let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false);
+        let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false, 1);
         // TL 格四角与边中点：全部是轮廓色
         for (x, y) in [
             (off, off),
@@ -601,6 +613,7 @@ mod tests {
             p.focus,
             255,
             false,
+            1,
         );
         // BR 格边框存在
         assert_eq!(
@@ -619,7 +632,7 @@ mod tests {
         let (sq, _gap, off) = geometry(size).unwrap();
         let p = Palette::defaults();
         let specs = plan(snap(false, Phase::Focus, 0.5, 1), &p);
-        let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false);
+        let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false, 1);
         let inner_top = off + 1;
         let inner_bottom = off + sq - 2; // 内区最后一行
                                          // 内区中部偏上（第 3 行 / 共 8 行）应透明
@@ -646,6 +659,7 @@ mod tests {
             p.focus,
             255,
             false,
+            1,
         );
         // TL 格中心透明（空心）
         assert_eq!(px(&buf, size, off + sq / 2, off + sq / 2), (0, 0, 0, 0));
@@ -661,6 +675,7 @@ mod tests {
             Rgb::new(0, 0, 0),
             255,
             false,
+            1,
         );
         assert!(buf.iter().all(|&b| b == 0));
     }
@@ -671,7 +686,7 @@ mod tests {
         let p = Palette::defaults();
         for size in [16, 24, 32, 48] {
             let specs = plan(snap(false, Phase::Focus, 0.5, 1), &p);
-            let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false);
+            let buf = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false, 1);
             assert_eq!(buf.len(), (size * size * 4) as usize);
             // 四角必透明（格阵居中，不会触及画布角）
             for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
@@ -694,12 +709,12 @@ mod tests {
         let glyph_x = 12;
         let glyph_y = 16;
         // 暂停态：格阵以 alpha=128 降亮传入，符号仍恒满不透明、取阶段色
-        let buf_paused = render_buf(size, &specs, p.idle_outline(), p.focus, 128, true);
+        let buf_paused = render_buf(size, &specs, p.idle_outline(), p.focus, 128, true, 1);
         let c = px(&buf_paused, size, glyph_x, glyph_y);
         assert_eq!((c.0, c.1, c.2), (p.focus.r, p.focus.g, p.focus.b));
         assert_eq!(c.3, 255, "glyph 恒满不透明，不随格阵降亮");
         // 非暂停态：同一位置透明（格阵间隙，无符号）
-        let buf_running = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false);
+        let buf_running = render_buf(size, &specs, p.idle_outline(), p.focus, 255, false, 1);
         assert_eq!(
             px(&buf_running, size, glyph_x, glyph_y),
             (0, 0, 0, 0),
@@ -707,21 +722,48 @@ mod tests {
         );
     }
 
-    /// 应用图标入口与托盘待机渲染逐像素一致（同一核心，无第二实现）
+    /// 应用图标 32px 标定档与托盘待机逐像素一致（同核同语义，边线宽同为 1px）
     #[test]
-    fn idle_rgba_matches_tray_idle() {
+    fn app_icon_matches_tray_idle_at_32px() {
         let p = Palette::defaults();
         assert_eq!(
-            idle_rgba(32, &p),
+            app_icon_rgba(32, &p),
             render_buf(
                 32,
                 &plan(Snapshot::idle(), &p),
                 p.idle_outline(),
                 p.focus,
                 255,
-                false
+                false,
+                1
             )
         );
+    }
+
+    /// 大尺寸应用图标：边线按比例取整加粗（256px → 8px）且四格保持空心
+    #[test]
+    fn app_icon_bold_outline_stays_hollow() {
+        assert_eq!(brand_line_w(16), 1);
+        assert_eq!(brand_line_w(32), 1);
+        assert_eq!(brand_line_w(48), 2);
+        assert_eq!(brand_line_w(64), 2);
+        assert_eq!(brand_line_w(128), 4);
+        let size = 256;
+        let (sq, gap, off) = geometry(size).unwrap();
+        let p = Palette::defaults();
+        let buf = app_icon_rgba(size, &p);
+        assert_eq!(brand_line_w(size), 8);
+        // 顶边框带内采样 = 轮廓色（恒 1px 时代该点位于透明内区）
+        assert_eq!(px(&buf, size, off + sq / 2, off + 4).0, p.idle_outline().r);
+        // 四格内区中心全部透明——空心「待填充」语义在任何尺寸下不变
+        for (cx, cy) in [
+            (off + sq / 2, off + sq / 2),
+            (off + sq + gap + sq / 2, off + sq / 2),
+            (off + sq / 2, off + sq + gap + sq / 2),
+            (off + sq + gap + sq / 2, off + sq + gap + sq / 2),
+        ] {
+            assert_eq!(px(&buf, size, cx, cy), (0, 0, 0, 0), "hollow at {cx},{cy}");
+        }
     }
 
     // —— 动画数学 ——

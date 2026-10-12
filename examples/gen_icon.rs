@@ -1,8 +1,8 @@
 //! 生成应用图标 `Winmato.ico`（仓库资产，一次性工具，非构建期依赖）。
 //!
-//! 复用托盘渲染核心（`icon::idle_rgba`）逐尺寸绘制「待填充四格」待机态——
-//! 每个尺寸独立推导几何而非缩放位图，任何尺寸下线条都精确 1px，
-//! 且 exe 图标与托盘待机图标语义、几何、配色逐像素一致。
+//! 复用托盘渲染核心（`icon::app_icon_rgba`）逐尺寸绘制「待填充四格」
+//! 品牌形态——每个尺寸独立推导几何而非缩放位图；边线随画布比例取整
+//! 加粗（1px@32 → 8px@256），大尺寸下四格轮廓完整显现、锐利无模糊。
 //!
 //! 用法：`cargo run --example gen_icon`
 //! 输出：`$CARGO_MANIFEST_DIR/Winmato.ico`（覆盖）
@@ -56,7 +56,7 @@ fn main() -> std::io::Result<()> {
 
 /// 单尺寸 BMP 图像项：BITMAPINFOHEADER + XOR（自底向上 BGRA）+ AND 掩码
 fn bmp_entry(size: i32, palette: &Palette) -> Vec<u8> {
-    let rgba = icon::idle_rgba(size, palette);
+    let rgba = icon::app_icon_rgba(size, palette);
     let w = size as usize;
     let xor_len = w * w * 4;
     let and_row = w.div_ceil(32) * 4; // AND 掩码行按 32 位对齐
