@@ -3,8 +3,8 @@
 //! 只读加载 %APPDATA%\Winmato\config.json。
 //! 缺失、损坏、字段非法时一律静默回退出厂默认参数——不报错、不弹窗、不写回。
 //!
-//! 配置单位为**秒**（当前测试用短时长 25s/5s/20s；正式版为 25min/5min/20min）。
-//! 秒级配置可让开发者/发烧友用 25s 等短时长快速验证完整番茄大周期；
+//! 配置单位为**秒**（出厂默认 1500s/300s/1200s，即 25min/5min/20min）。
+//! 秒级配置让开发者/发烧友可用短时长（如 25s）快速验证完整番茄大周期；
 //! 合法范围 1..=36000 秒（1 秒 ~ 10 小时），越界回退默认。
 
 use std::path::PathBuf;
@@ -16,12 +16,10 @@ use crate::colors::{Palette, Rgb};
 
 /// 出厂默认时长（秒）——全局唯一事实来源。
 /// 程序默认与配置解析回退共用此常量，杜绝两处字面量漂移（避免重复实现）。
-///
-/// 注意：当前为**测试用短时长**（25s/5s/20s），用于快速验证完整大周期。
-/// 发布正式版前须改回真实番茄钟时长（1500/300/1200 秒）。
-pub const DEFAULT_FOCUS_SECS: u64 = 25;
-pub const DEFAULT_SHORT_BREAK_SECS: u64 = 5;
-pub const DEFAULT_LONG_BREAK_SECS: u64 = 20;
+/// 真实番茄钟节奏：专注 25min / 短休 5min / 长休 20min。
+pub const DEFAULT_FOCUS_SECS: u64 = 1500;
+pub const DEFAULT_SHORT_BREAK_SECS: u64 = 300;
+pub const DEFAULT_LONG_BREAK_SECS: u64 = 1200;
 
 /// 时长合法区间（秒）：1 ~ 10 小时
 const MIN_SECS: u64 = 1;
