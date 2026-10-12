@@ -2,7 +2,8 @@
 //!
 //! 通过 `SetWindowCompositionAttribute`（undocumented 但经 TranslucentTB
 //! 八年、数百万用户实战验证的 user32 导出）把任务栏底色染为当前阶段色相。
-//! windows-rs 未声明此 API，故此处手工声明 FFI——全部系统复杂度内埋本模块，
+//! windows-rs 未声明此 API 且未收录于官方 user32 导入库，故经 GetProcAddress
+//! 运行期动态解析——全部系统复杂度内埋本模块，
 //! 调用方只看到 `apply(hwnd, Option<Rgb>) -> bool`。
 //!
 //! 降级契约（文档 §4.1 渲染降级阶梯）：
@@ -100,7 +101,6 @@ pub fn apply(hwnd: HWND, tint: Option<Rgb>) -> bool {
 /// 系统任务栏是否为浅色主题（浅色 → 系统文字为黑字，染色需向白提亮）。
 /// 注册表缺失/读取失败时返回 false（深色，Windows 出厂默认）。
 pub fn system_taskbar_is_light() -> bool {
-    use windows::core::w;
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
     let mut value: u32 = 0;

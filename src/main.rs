@@ -240,8 +240,13 @@ impl App {
                 }
             }
             // 细条（快变量通道）：进度填充 + 刻点 + 边界脉冲 + 暂停呼吸，
-            // 染色生效时叠加在任务栏顶缘之上，染色降级时独立承担全部视觉
-            // 覆盖层缺失或父任务栏已销毁（资源管理器重启）→ 静默重建（文档 §7）
+            // 染色生效时底色须与任务栏染色一致（§4.2 细条同色底色），
+            // 染色降级时用原始阶段色独立承担全部视觉（最大可见度）
+            let strip_color = if b.tint_applied.is_some() {
+                tint_color
+            } else {
+                target
+            };
             let need_new = match b.overlay.as_ref() {
                 None => true,
                 Some(o) => !o.is_alive(),
@@ -256,7 +261,7 @@ impl App {
             if !o.is_visible() {
                 o.show();
             }
-            o.render(snap, target, now);
+            o.render(snap, strip_color, now);
         }
     }
 
@@ -366,6 +371,9 @@ fn main() {
                     let app = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
                     app.restore_all_tints();
                     PostQuitMessage(0);
+                    // 跳过本帧 DispatchMessageW——若 msg 是 WM_TIMER，
+                    // on_timer→apply 会重新染色，覆盖刚恢复的原生外观
+                    continue;
                 }
             }
             // 托盘图标事件：左键 Down → toggle

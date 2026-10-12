@@ -229,7 +229,7 @@ tick(Δt) → snapshot()
      （仅间隔实际变化时才调 SetTimer，避免重复重置丢帧）
 ```
 
-6. **染色调度**（需求文档 §4.1 策略 D，`apply` 内）：`Bar.tint_ok` 三态探测（None=未探测 / `Some(true)`=生效 / `Some(false)`=永久降级为纯细条，不逐帧重试，仅几何重建才重置）+ `tint_applied` 按色去重——仅阶段/主题/几何变化才调用 FFI，杜绝动画帧率下重复 DWM 重合成。待机恢复原生外观并重置探测；启动自愈清理上次异常退出残留染色；菜单退出与 `WM_DESTROY` 双路径恢复原生外观
+6. **染色调度**（需求文档 §4.1 策略 D，`apply` 内）：`Bar.tint_ok` 三态探测（None=未探测 / `Some(true)`=生效 / `Some(false)`=永久降级为纯细条，不逐帧重试，仅几何重建才重置）+ `tint_applied` 按色去重——仅阶段/主题/几何变化才调用 FFI，杜绝动画帧率下重复 DWM 重合成。细条底色选择：染色生效时用 `tint_color`（与任务栏同色，§4.2 细条同色底色），降级时用 `target`（原始阶段色，最大可见度）。待机恢复原生外观并重置探测；启动自愈清理上次异常退出残留染色；菜单退出 `continue` 跳过本帧 `DispatchMessageW`（防止 `on_timer→apply` 重新染色覆盖刚恢复的原生外观）与 `WM_DESTROY` 双路径恢复原生外观
 
 **系统广播处理**（wnd_proc）：
 
@@ -252,7 +252,8 @@ tick(Δt) → snapshot()
       → apply(snap)
           → 托盘镜像：IDLE_DOT → Focus 绿色实心（set_icon）
           → 染色（慢变量）：ensure_contrast 钳制后按色去重应用（tint_ok 三态探测）
-          → 逐 Bar：覆盖层缺失/失效则重建 → show() → render()
+          → 逐 Bar：strip_color = 染色生效 ? tint_color : target
+              → 覆盖层缺失/失效则重建 → show() → render(strip_color)
               → update_anim_state: stage_seq 边沿 → 脉冲启动
               → resolve_color: 无过渡（首帧）→ 无脉冲峰值（t=0 增益 0）
               → draw: 进度 0 → 整条底色 + 4 刻点（1 亮 3 灭）
@@ -327,6 +328,8 @@ tick(Δt) → snapshot()
 4. **undocumented API 的导入库缺失**：`SetWindowCompositionAttribute` 无法静态链接（LNK2019），必须 `GetProcAddress` 动态解析——与降级阶梯互为表里：解析失败即永久降级，无需额外探测代码。
 5. **染色不参与阶段过渡插值**：0.6s 插值仅作用于细条像素；任务栏整体染色在阶段边界一步到位——2.5s 边界脉冲已提供完整的过渡语义，对慢通道再插值只会把 FFI 频率拉高 20 倍，与同色去重直接冲突。
 6. **同色去重（`tint_applied` 缓存）**：染色是慢变量，动画帧率下重发同一颜色徒增 DWM 重合成调用；按色比较跳过，语义零损失。
+7. **细条底色跟随染色而非原色**：染色生效时细条用 `tint_color`（WCAG 钳制后的色），满足 §4.2「细条同色底色」——否则 ShortBreak/LongBreak 默认配色在深色任务栏上细条比任务栏亮（原色对比度 < 4.5:1 被压暗），视觉割裂。降级时用 `target` 原色，保证原生任务栏上的最大可见度。
+8. **退出路径 `continue` 而非 fall-through**：`restore_all_tints()` + `PostQuitMessage(0)` 后必须跳过本帧 `DispatchMessageW`——若 `msg` 是 `WM_TIMER`，`on_timer→apply` 会重新染色，进程退出后残留任务栏被染色的残迹（§7 不留残迹）。
 
 ## 11. 不变量总清单（改代码前必读）
 
@@ -340,3 +343,4 @@ tick(Δt) → snapshot()
 8. 反目标清单（§1.2）神圣不可侵犯
 9. 渲染降级阶梯单调：D 染色 → C 嵌入细条 → 待机透明，**永不回弹**（仅几何重建才重置探测）；待机与退出必恢复任务栏原生外观
 10. 染色色相必经 WCAG 钳制（系统文字对比度 ≥4.5:1），且为慢变量按色去重——绝不在动画帧率下重复调用 FFI
+11. 染色生效时细条底色 = `tint_color`（与任务栏同色），降级时 = `target`（原色，最大可见度）——绝不在染色生效时让细条色相与任务栏不一致
